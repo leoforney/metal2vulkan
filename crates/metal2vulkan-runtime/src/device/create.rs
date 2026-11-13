@@ -791,7 +791,7 @@ pub(crate) fn default_loaders(vulkan_sdk: Option<&Path>) -> Vec<PathBuf> {
             .collect()
     } else if cfg!(windows) {
         vec![PathBuf::from("vulkan-1.dll")]
-    } else if cfg!(target_os = "android") {
+    } else if cfg!(any(target_os = "android", target_os = "fuchsia")) {
         vec![PathBuf::from("libvulkan.so")]
     } else {
         vec![PathBuf::from("libvulkan.so.1")]
@@ -800,6 +800,7 @@ pub(crate) fn default_loaders(vulkan_sdk: Option<&Path>) -> Vec<PathBuf> {
 
 /// The Vulkan loader: `loader` where the options name one, else the first of
 /// [`default_loaders`] that opens. [`Error::LoaderNotFound`] names each library tried.
+#[cfg(not(target_os = "fuchsia"))]
 pub(crate) fn open_loader(loader: Option<&Path>) -> Result<ash::Entry, Error> {
     let tried = match loader {
         Some(path) => vec![path.to_path_buf()],
@@ -812,6 +813,12 @@ pub(crate) fn open_loader(loader: Option<&Path>) -> Result<ash::Entry, Error> {
         }
     }
     Err(Error::LoaderNotFound(LoaderNotFound { tried }))
+}
+
+/// The Vulkan loader on Fuchsia, where `libvulkan.so` is linked into the component binary.
+#[cfg(target_os = "fuchsia")]
+pub(crate) fn open_loader(_loader: Option<&Path>) -> Result<ash::Entry, Error> {
+    Ok(ash::Entry::linked())
 }
 
 /// `vkCreateInstance` of `info` from `entry`: every instance the runtime creates, its devices' and

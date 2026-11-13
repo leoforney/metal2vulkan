@@ -1439,7 +1439,7 @@ struct Pages {
 
 impl Pages {
     /// `length` bytes of new pages; `None` where the system maps none.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fuchsia"))]
     fn map(length: u64) -> Option<Pages> {
         let bytes = usize::try_from(length).ok()?;
         // SAFETY: a new private anonymous mapping, at an address the kernel picks.
@@ -1464,7 +1464,7 @@ impl Pages {
     }
 
     /// None off Unix.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, target_os = "fuchsia")))]
     fn map(_length: u64) -> Option<Pages> {
         None
     }
@@ -1514,7 +1514,7 @@ impl Drop for Pages {
         if self.imports.get() != 0 {
             return;
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fuchsia"))]
         // SAFETY: the mapping is the check's, and no import of it is live.
         unsafe {
             libc::munmap(self.start.as_ptr().cast(), self.length as usize);

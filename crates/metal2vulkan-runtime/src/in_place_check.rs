@@ -1510,7 +1510,7 @@ fn unimported(device: &Device, why: &str) -> Unmade {
 /// A no-copy buffer of `length` bytes over anonymous pages mapped for it, imported by their
 /// pointer, which its keep-alive unmaps ([`Anonymous`]). Why not, where the device makes none,
 /// or does not import the pointer (dma-bufs, or a copied host buffer, `copied.rs`).
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 fn pointer_pages(device: &Device, length: u64) -> Result<ClassPages, Unmade> {
     let start = map_anonymous(length).ok_or_else(|| {
         Unmade::passing(format!("no anonymous mapping of {length} bytes was made"))
@@ -1535,7 +1535,7 @@ fn pointer_pages(device: &Device, length: u64) -> Result<ClassPages, Unmade> {
 /// keep-alive, not a deallocator, so the buffer's release runs at Metal's moment and waits for no
 /// batch submitted before it (`HostPages`'s release), and `pages` goes once the import is freed
 /// (`KeepAlive`). Why not, where the device refuses the buffer, `pages` dropped with the refusal.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 fn no_copy_kept(
     device: &Device,
     memory: HostMemory,
@@ -1554,17 +1554,17 @@ fn no_copy_kept(
 }
 
 /// Anonymous pages [`map_anonymous`] mapped, unmapped as this goes: a check buffer's keep-alive.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 struct Anonymous {
     start: NonNull<u8>,
     length: u64,
 }
 
 // SAFETY: the mapping is this value's alone to unmap, from any thread, once nothing uses it.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 unsafe impl Send for Anonymous {}
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 impl Drop for Anonymous {
     fn drop(&mut self) {
         unmap(self.start, self.length);
@@ -1572,7 +1572,7 @@ impl Drop for Anonymous {
 }
 
 /// Anonymous private pages of `length` bytes, readable and writable, read as zero.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 fn map_anonymous(length: u64) -> Option<NonNull<u8>> {
     // SAFETY: a new private anonymous mapping, at an address the kernel chooses.
     let mapped = unsafe {
@@ -1592,14 +1592,14 @@ fn map_anonymous(length: u64) -> Option<NonNull<u8>> {
 }
 
 /// Unmap the `length` bytes `map_anonymous` mapped at `pointer`.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 fn unmap(pointer: NonNull<u8>, length: u64) {
     // SAFETY: the mapping `map_anonymous` made, which nothing uses any more.
     unsafe { libc::munmap(pointer.as_ptr().cast(), length as usize) };
 }
 
 /// No anonymous pages are mapped on this system: the class is unchecked.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "fuchsia")))]
 fn pointer_pages(_device: &Device, _length: u64) -> Result<ClassPages, Unmade> {
     Err(Unmade::lasting(
         "the system maps no anonymous pages for the check",
@@ -2159,7 +2159,7 @@ impl Bytes {
 
 /// The host's page size.
 fn host_page() -> u64 {
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fuchsia"))]
     {
         // SAFETY: a query of the page size, with no argument.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };

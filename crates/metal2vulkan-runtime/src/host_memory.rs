@@ -658,7 +658,7 @@ pub(super) fn binds_in(
 }
 
 /// The host's page size, where the runtime knows how to ask for it.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 pub(super) fn host_page() -> Option<u64> {
     // SAFETY: `sysconf` reads a system constant.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -666,7 +666,7 @@ pub(super) fn host_page() -> Option<u64> {
 }
 
 /// The host's page size, where the runtime knows how to ask for it: not on this system.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "fuchsia")))]
 pub(super) fn host_page() -> Option<u64> {
     None
 }
@@ -778,8 +778,14 @@ pub(super) fn mapped_readable(start: u64, end: u64) -> bool {
     mappings_permitted(start, end, Access::Read, &mut 0) == Some(true)
 }
 
+/// [`mapped_readable`] on Fuchsia, where `HostMemory::new`'s safety contract keeps VMO pages mapped readable.
+#[cfg(target_os = "fuchsia")]
+pub(super) fn mapped_readable(_start: u64, _end: u64) -> bool {
+    true
+}
+
 /// [`mapped_readable`] where the runtime does not ask the system for its mappings: `false`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "fuchsia")))]
 pub(super) fn mapped_readable(_start: u64, _end: u64) -> bool {
     false
 }
@@ -846,9 +852,15 @@ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
     true
 }
 
+/// [`mapped_writable`] on Fuchsia, where `HostMemory::new`'s safety contract keeps shared VMO pages mapped writable.
+#[cfg(target_os = "fuchsia")]
+pub(super) fn mapped_writable(_start: u64, _end: u64) -> bool {
+    true
+}
+
 /// [`mapped_writable`] where the runtime does not ask the system for its mappings: `false` (and no
 /// copy is made here: the runtime reads no caller's page, [`mapped_readable`]).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "fuchsia")))]
 pub(super) fn mapped_writable(_start: u64, _end: u64) -> bool {
     false
 }

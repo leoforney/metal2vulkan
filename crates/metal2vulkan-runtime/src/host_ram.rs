@@ -163,9 +163,18 @@ use super::host_memory::{
     binds_in, host_page, import_refused, not_importable, ImportWindow, Importer, KeepAlive,
     RunResolver,
 };
+#[cfg(unix)]
 use super::host_residency;
 #[cfg(unix)]
 use super::host_residency::Again;
+
+#[cfg(not(unix))]
+mod host_residency {
+    use std::time::Duration;
+    pub(super) const IDLE: Duration = Duration::from_secs(2);
+    pub(super) const IDLE_MOST: Duration = Duration::from_secs(64);
+    pub(super) const TICK: Duration = Duration::from_millis(500);
+}
 use super::memory::{ImportFailure, Mapped, MemoryClass, Placement};
 use super::program_objects::ProgramObject;
 use super::Device;

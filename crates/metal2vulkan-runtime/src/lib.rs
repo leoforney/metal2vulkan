@@ -81,7 +81,6 @@ mod derived;
 mod descriptor_arena;
 mod detach;
 mod device;
-#[cfg(unix)]
 mod dirty_pages;
 mod dispatch_execute;
 mod dma_buf;
@@ -137,7 +136,7 @@ mod host_memory;
 mod host_ram;
 #[cfg(unix)]
 mod host_residency;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 mod host_shared_pointers;
 mod image_barrier;
 mod image_plan;

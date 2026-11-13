@@ -95,7 +95,7 @@ unsafe impl Sync for OwnPages {}
 impl OwnPages {
     /// `length` bytes of new anonymous private pages, read-write, at a host page; `None` where
     /// the system maps none.
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fuchsia"))]
     pub(super) fn map(length: u64) -> Option<OwnPages> {
         let bytes = usize::try_from(length).ok()?;
         // SAFETY: a new private anonymous mapping, at an address the kernel picks.
@@ -117,7 +117,7 @@ impl OwnPages {
     }
 
     /// No pages are mapped on this system.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, target_os = "fuchsia")))]
     pub(super) fn map(_length: u64) -> Option<OwnPages> {
         None
     }
@@ -135,7 +135,7 @@ impl OwnPages {
 
 impl Drop for OwnPages {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fuchsia"))]
         // SAFETY: the mapping is this value's, and nothing reads it any more: the memory
         // imported from it was freed first (`memory.rs`'s `Block`).
         unsafe {

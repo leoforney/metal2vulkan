@@ -232,11 +232,11 @@ pub fn host_time() -> f64 {
 
 /// The host time now, in nanoseconds of the host's clock.
 pub(crate) fn host_nanos() -> u64 {
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fuchsia"))]
     {
         read_clock(BASE).unwrap_or(0)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, target_os = "fuchsia")))]
     {
         use std::sync::OnceLock;
         use std::time::Instant;
@@ -248,11 +248,11 @@ pub(crate) fn host_nanos() -> u64 {
 /// The host's clock.
 #[cfg(target_os = "macos")]
 const BASE: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(any(all(unix, not(target_os = "macos")), target_os = "fuchsia"))]
 const BASE: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
 
 /// `clock` now, in nanoseconds.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 fn read_clock(clock: libc::clockid_t) -> Option<u64> {
     let mut now = libc::timespec {
         tv_sec: 0,
@@ -268,7 +268,7 @@ fn read_clock(clock: libc::clockid_t) -> Option<u64> {
 }
 
 /// The host clock behind a Vulkan host time domain, where the runtime can read it.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "fuchsia"))]
 fn domain_clock(domain: vk::TimeDomainKHR) -> Option<libc::clockid_t> {
     match domain {
         vk::TimeDomainKHR::CLOCK_MONOTONIC => Some(libc::CLOCK_MONOTONIC),
@@ -284,7 +284,7 @@ pub(crate) fn host_domain(offered: &[vk::TimeDomainKHR]) -> Option<vk::TimeDomai
     if !offered.contains(&vk::TimeDomainKHR::DEVICE) {
         return None;
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "fuchsia"))]
     {
         let preferred = [
             vk::TimeDomainKHR::CLOCK_MONOTONIC_RAW,
@@ -297,7 +297,7 @@ pub(crate) fn host_domain(offered: &[vk::TimeDomainKHR]) -> Option<vk::TimeDomai
             .chain(preferred)
             .find(|domain| offered.contains(domain))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, target_os = "fuchsia")))]
     {
         None
     }
@@ -851,7 +851,7 @@ impl Calibration {
         ];
         let mut values = [0u64; 2];
         let mut deviation = 0u64;
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fuchsia"))]
         let domain = domain_clock(self.domain)?;
         // SAFETY: the device is live (the caller holds it) and enabled the extension the entry
         // point belongs to; the arrays hold one value per info.
@@ -867,7 +867,7 @@ impl Calibration {
         if result != vk::Result::SUCCESS {
             return None;
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "fuchsia"))]
         {
             // The domain's clock onto the host's: both read at once, the host's around it.
             let (host, around) = if domain == BASE {
@@ -889,7 +889,7 @@ impl Calibration {
                 deviation: deviation.saturating_add(around),
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, target_os = "fuchsia")))]
         {
             None
         }

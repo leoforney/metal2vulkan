@@ -1015,8 +1015,18 @@ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
     answer == libc::KERN_SUCCESS && read == into.len() as u64
 }
 
+/// [`read_pages`] on Fuchsia, where `HostMemory::new`'s safety contract guarantees mapped readable pages.
+#[cfg(target_os = "fuchsia")]
+pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+    // SAFETY: `HostMemory::new` guarantees `into.len()` readable bytes at `pages` without aliasing `into`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(pages.as_ptr(), into.as_mut_ptr(), into.len());
+    }
+    true
+}
+
 /// [`read_pages`] where the system is not asked: nothing is copied.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "fuchsia")))]
 pub(crate) fn read_pages(_pages: NonNull<u8>, _into: &mut [u8]) -> bool {
     false
 }

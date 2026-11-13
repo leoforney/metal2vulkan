@@ -26,7 +26,6 @@
 use std::ffi::CString;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -131,7 +130,8 @@ impl SystemLayer {
             if parts.peek().is_none() {
                 break;
             }
-            let path = c_path(above.as_os_str().as_bytes()).ok_or("a path with a zero byte")?;
+            let path =
+                c_path(above.as_os_str().as_encoded_bytes()).ok_or("a path with a zero byte")?;
             // SAFETY: a zeroed stat is a valid out value and the path is a C string.
             let (result, st) = unsafe {
                 let mut st: libc::stat = std::mem::zeroed();
@@ -156,7 +156,7 @@ impl SystemLayer {
                 ));
             }
         }
-        let fd = open_level(None, root.as_os_str().as_bytes(), true)
+        let fd = open_level(None, root.as_os_str().as_encoded_bytes(), true)
             .map_err(|errno| format!("{}: errno {errno}", root.display()))?;
         let layer = SystemLayer {
             root: fd,
@@ -202,7 +202,7 @@ impl SystemLayer {
             };
             let last = parts.peek().is_none();
             let parent = level.as_ref().unwrap_or(&self.root);
-            let fd = match open_level(Some(parent), name.as_bytes(), !last) {
+            let fd = match open_level(Some(parent), name.as_encoded_bytes(), !last) {
                 Ok(fd) => fd,
                 Err(errno) => {
                     // A link in an entry's place (ELOOP), or a file where a directory belongs.

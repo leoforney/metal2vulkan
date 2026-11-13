@@ -1719,7 +1719,10 @@ fn install() {
 }
 
 /// Register [`exit_handler`] with the C library's exit handlers.
-#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
+#[cfg(all(
+    any(unix, target_os = "fuchsia"),
+    not(all(target_os = "linux", target_env = "gnu"))
+))]
 fn install() {
     INSTALLED.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `exit_handler` is a function with no arguments that never unwinds. Registration
@@ -1729,7 +1732,7 @@ fn install() {
 }
 
 /// Nothing to register: the runtime is built for unix hosts, whose exit order the hook relies on.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "fuchsia")))]
 fn install() {}
 
 // The GNU C library's `on_exit(3)` (`<stdlib.h>`), which `libc` does not declare: `function` is
@@ -1765,7 +1768,10 @@ extern "C" fn exit_handler(status: std::ffi::c_int, _: *mut std::ffi::c_void) {
 
 /// The exit handler, where it learns no status (`atexit`): the hook waits at most [`BOUND`], or
 /// [`MAKING_BOUND`] while a making is in progress, and returns.
-#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
+#[cfg(all(
+    any(unix, target_os = "fuchsia"),
+    not(all(target_os = "linux", target_env = "gnu"))
+))]
 extern "C" fn exit_handler() {
     hook(
         &GUARD,

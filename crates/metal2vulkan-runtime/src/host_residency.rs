@@ -119,18 +119,25 @@ const FD_SHARE: u64 = 4;
 /// The descriptors of dma-bufs the process's devices keep at most for imports they may release
 /// ([`FD_SHARE`] of the process's soft limit): an import past them stays imported.
 pub(super) fn kept_fds_limit() -> u64 {
-    static LIMIT: OnceLock<u64> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `limit` is a valid `rlimit` to write.
-        match unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } {
-            0 => limit.rlim_cur / FD_SHARE,
-            _ => 0,
-        }
-    })
+    #[cfg(target_os = "fuchsia")]
+    {
+        256
+    }
+    #[cfg(not(target_os = "fuchsia"))]
+    {
+        static LIMIT: OnceLock<u64> = OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `limit` is a valid `rlimit` to write.
+            match unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } {
+                0 => limit.rlim_cur / FD_SHARE,
+                _ => 0,
+            }
+        })
+    }
 }
 
 /// The descriptors the process's devices keep now, within [`kept_fds_limit`].

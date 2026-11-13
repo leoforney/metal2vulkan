@@ -315,6 +315,26 @@ impl<R: Copy + Eq + Hash, M: Clone + Eq + Hash> Recycler<R, M> {
         Some(self.unindexed(order, parked))
     }
 
+    /// The objects parked longer than the bounds' time at `now`, out of the recycler, or every
+    /// parked object where `all`: what a device lets go of when its time passes with no making or
+    /// release to notice it (the room thread, `device/room.rs`), and when the system reports
+    /// memory pressure (`Device::release_kept_memory`). A parked object keeps its placement, so
+    /// its block stays live: a process that released its last textures and then made nothing more
+    /// kept up to the bounds' bytes parked for good.
+    pub(crate) fn aged(&mut self, now: Instant, all: bool) -> Gone<R> {
+        if !all {
+            return self.stale(now);
+        }
+        let mut gone = Gone::new();
+        while let Some((order, parked)) = self.trial.pop_first(None) {
+            gone.push(self.unindexed(order, parked));
+        }
+        while let Some((order, parked)) = self.proven.pop_first(None) {
+            gone.push(self.unindexed(order, parked));
+        }
+        gone
+    }
+
     /// The objects parked longer than the bounds' time at `now`, out of the recycler.
     fn stale(&mut self, now: Instant) -> Gone<R> {
         let stale = Some((now, self.bounds.parked_for));

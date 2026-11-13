@@ -252,7 +252,7 @@ pub fn float_binary(
         _ => BinOp::FRem,
     };
     let r = fb.binary_with(o, a, b, contract)?;
-    narrow::round(fb, f, r)
+    narrow::round_native(fb, f, r)
 }
 
 /// The census name of a `half` operator on the device's 16-bit arithmetic

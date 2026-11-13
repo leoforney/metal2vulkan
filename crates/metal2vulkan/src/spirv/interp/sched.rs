@@ -588,6 +588,18 @@ impl Lane {
 
     /// Set the current frame's value `v`.
     pub(super) fn set(&mut self, p: &Prog<'_>, v: Value, val: Val) -> IResult<()> {
+        // A result decorated `RelaxedPrecision` (`narrow::round_native`): the model of a device
+        // that computes it on 16-bit floats, its `f32` result rounded to `half` to nearest even,
+        // denormals kept. A device may flush them and round otherwise
+        // (`PrecisionNote::NativeHalfConversion`).
+        let val = if p.m.relaxed().contains(&v) {
+            super::eval::map1(&val, |x| {
+                let h = super::float::f64_to_f16(super::float::to_f64(x, 32)?);
+                super::float::from_f64(super::float::f16_to_f64(h), 32)
+            })?
+        } else {
+            val
+        };
         self.top_mut()?.define(p, v, val)
     }
 

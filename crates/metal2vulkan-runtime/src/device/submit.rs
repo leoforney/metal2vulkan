@@ -503,6 +503,7 @@ impl Device {
     }
 
     /// The error of a failed submission or wait, recording a lost device.
+    #[track_caller]
     pub(crate) fn failed(&self, error: vk::Result) -> Error {
         if error == vk::Result::ERROR_DEVICE_LOST {
             self.mark_lost();

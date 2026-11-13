@@ -106,6 +106,9 @@ pub struct ModuleBuilder {
     /// (`ModuleBuilder::note_measured_rounding`). Nothing emitted depends on it: the compile
     /// reads it to decide `PrecisionNote::NativeHalfConversion`.
     pub(super) measured_roundings: BTreeSet<Value>,
+    /// The results of `half` operations the device computes at its own 16-bit precision
+    /// (`ModuleBuilder::note_relaxed`): the serializer decorates each `RelaxedPrecision`.
+    pub(super) relaxed: BTreeSet<Value>,
     /// The texels the texture family's writes store (`ModuleBuilder::note_stored_texel`), whose
     /// stored NaN the write's own notes account for (`lower::texture::half_write_nans` and
     /// `half_storage_facts`). Nothing emitted depends on it: the compile reads it to decide
@@ -178,6 +181,9 @@ pub struct ModuleBuilder {
     /// Whether a `half`'s NaN bits are the device's conversion's under the float controls
     /// ([`ModuleBuilder::native_half_nans`]).
     native_half_nans: bool,
+    /// Whether a `half` operation's result is left to the device's own 16-bit precision
+    /// ([`ModuleBuilder::relaxed_half`]).
+    relaxed_half: bool,
 }
 
 /// How a float multiply the device must round on its own and never fuse is emitted
@@ -318,6 +324,28 @@ impl ModuleBuilder {
         self.native_half = native;
     }
 
+    /// Leave the result of a `half` operation the device has an instruction for to the device's
+    /// own 16-bit precision (`narrow::round_native`): decorated `RelaxedPrecision`, with no
+    /// conversion pair. Emission sets it before any instruction, from the profile
+    /// (`narrow::relaxes`); a builder that never sets it rounds every result in its
+    /// [`QuantizeForm`].
+    pub fn set_relaxed_half(&mut self, relaxed: bool) {
+        self.relaxed_half = relaxed;
+    }
+
+    /// Whether a `half` operation's result is left to the device's own 16-bit precision
+    /// ([`ModuleBuilder::set_relaxed_half`]).
+    pub fn relaxed_half(&self) -> bool {
+        self.relaxed_half
+    }
+
+    /// Record `result`, an `f32` holding the result of a `half` operation, as computed at the
+    /// device's own 16-bit precision: the serializer decorates it `RelaxedPrecision`
+    /// (`narrow::round_native`).
+    pub fn note_relaxed(&mut self, result: Value) {
+        self.relaxed.insert(result);
+    }
+
     /// Record `narrowed`, the narrowing to 16 bits of a conversion pair that rounds a `half` in a
     /// form measured to answer Metal's where the driver takes
     /// `DriverDeviation::MetalHalfConversion` (`narrow::round_measured`).
@@ -393,6 +421,7 @@ impl ModuleBuilder {
             )
             + tree_bytes(self.non_uniform.len(), std::mem::size_of::<Value>())
             + tree_bytes(self.measured_roundings.len(), std::mem::size_of::<Value>())
+            + tree_bytes(self.relaxed.len(), std::mem::size_of::<Value>())
             + tree_bytes(self.stored_texels.len(), std::mem::size_of::<Value>())
             + map_bytes(&self.bits)
             + map_bytes(&self.lanes)
@@ -1401,6 +1430,7 @@ impl ModuleBuilder {
             enabling: self.enabling,
             non_uniform: self.non_uniform,
             measured_roundings: self.measured_roundings,
+            relaxed: self.relaxed,
             stored_texels: self.stored_texels,
             #[cfg(test)]
             uniform_vars: self.uniform_vars,

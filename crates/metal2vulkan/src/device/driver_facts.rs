@@ -753,6 +753,13 @@ pub(crate) const INTEL_UHD_770_RPL_S: u32 = 0xa780;
 /// `intel-irisxe-rplp-anv`).
 pub(crate) const INTEL_IRIS_XE_RPL_P: u32 = 0xa7a0;
 
+/// Qualcomm's `vendorID`.
+const QUALCOMM_VENDOR_ID: u32 = 0x5143;
+
+/// The `deviceID` Turnip reports for the Adreno 740: its chip id (Mesa's `tu_device.cc`,
+/// `props->deviceID = pdevice->dev_id.chip_id`; `freedreno_devices.py`, `FD740`).
+pub(crate) const ADRENO_740: u32 = 0x4305_0a01;
+
 /// The row of `fact` measured on Mesa's `driver` on the GPU `(vendor, device)`.
 const fn mesa_on<F>(fact: F, driver: DriverId, (vendor, device): (u32, u32)) -> Measured<F> {
     Measured {
@@ -1947,6 +1954,16 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
 /// row, ANV, Mesa 26.2.4, on the Iris Xe (RPL-P). Not listed: NVIDIA's 615.71.09, whose RTX 3080
 /// left a third answer; RADV on the RX 7900 XTX, clean at dd718a7905 at Mesa 26.0.8 but not
 /// measured since; and every GPU not measured, which store with `STORE`.
+/// Turnip on the Adreno 740 takes it by its source, not by that measurement (as
+/// `DontCareStoreIsMetals` is read in MoltenVK's): an attachment's store is its store operation
+/// being `STORE` and nothing else (`tu_pass.cc`, `attachment_set_ops`: `att->store = (store_op ==
+/// VK_ATTACHMENT_STORE_OP_STORE)`); a pass rendered in tile memory writes an attachment's memory
+/// only in its tile store, which returns before any command for one not stored
+/// (`tu_clear_blit.cc`, `tu_store_gmem_attachment`: `if (!dst->store && !dst->store_stencil)
+/// return;`), so every texel is the earlier one; a pass rendered in system memory
+/// (`tu_cmd_buffer.cc`, `tu_cmd_render_sysmem`) clears and draws into the attachment's own
+/// memory, so every texel is the one `STORE` leaves. Turnip chooses one of the two for a whole
+/// pass (`use_sysmem_rendering`).
 ///
 /// `InterlockOrdersDraws`, measured with no barrier between such draws on any driver (a scratch
 /// build of the commit that adds it), by `runtime_lane::interlocked_draw_order` (passes of 84
@@ -2250,6 +2267,12 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
         DriverFact::DontCareStoreIsOneOfMetals,
         DriverId::INTEL_OPEN_SOURCE_MESA,
         (INTEL_VENDOR_ID, INTEL_IRIS_XE_RPL_P),
+    ),
+    // Read in Mesa's source, not measured (the docs above).
+    mesa_on(
+        DriverFact::DontCareStoreIsOneOfMetals,
+        DriverId::MESA_TURNIP,
+        (QUALCOMM_VENDOR_ID, ADRENO_740),
     ),
     mesa_on(
         DriverFact::ColorBlockDecodeIsMetals,

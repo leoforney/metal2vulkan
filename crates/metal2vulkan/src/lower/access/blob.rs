@@ -169,13 +169,45 @@ pub fn blob_ptr(cx: &SelectCx<'_>, v: Value) -> Result<LocalPtr, Error> {
     let Value::Const(c) = v else {
         return Ok(LocalPtr::Value(operand(cx, v)?));
     };
-    match cx.entry.module.consts().get(c).map(|k| &k.value) {
-        Some(Const::GlobalAddr(g)) => {
-            let off = global_offset(cx.memory, *g).ok_or_else(refuse)?;
-            Ok(LocalPtr::Offset(u32::try_from(off).map_err(|_| refuse())?))
+    blob_const_offset(cx, c).map(LocalPtr::Offset)
+}
+
+/// Constant pointer expressions preserve the blob's byte offset through casts
+/// and constant GEPs. Walk the expression chain without recursive stack growth.
+fn blob_const_offset(cx: &SelectCx<'_>, mut c: crate::air::ir::ConstId) -> Result<u32, Error> {
+    use crate::air::ir::ConstExpr;
+    let mut displacement = 0i64;
+    for _ in 0..cx.entry.module.consts().len() {
+        match cx.entry.module.consts().get(c).map(|k| &k.value) {
+            Some(Const::GlobalAddr(g)) => {
+                let base = global_offset(cx.memory, *g).ok_or_else(refuse)?;
+                let base = i64::try_from(base).map_err(|_| refuse())?;
+                return u32::try_from(base.checked_add(displacement).ok_or_else(refuse)?)
+                    .map_err(|_| refuse());
+            }
+            Some(Const::Expr(ConstExpr::Cast {
+                op: CastOp::Bitcast | CastOp::AddrSpaceCast,
+                ops,
+            })) => {
+                c = *ops.first().ok_or_else(refuse)?;
+            }
+            Some(Const::Expr(ConstExpr::Gep { src_ty, ops, .. })) => {
+                let (base, indices) = ops.split_first().ok_or_else(refuse)?;
+                let indices: Vec<Value> = indices.iter().copied().map(Value::Const).collect();
+                let (delta, strides) = crate::memory::provenance::gep_displacement(
+                    cx.entry,
+                    &cx.memory.layouts,
+                    *src_ty,
+                    &indices,
+                )?;
+                let delta = delta.filter(|_| strides.is_empty()).ok_or_else(refuse)?;
+                displacement = displacement.checked_add(delta).ok_or_else(refuse)?;
+                c = *base;
+            }
+            _ => return Err(refuse()),
         }
-        _ => Err(refuse()),
     }
+    Err(refuse())
 }
 
 /// A leaf load of AIR type `ty` with alignment `align` through blob pointer `ptr`.

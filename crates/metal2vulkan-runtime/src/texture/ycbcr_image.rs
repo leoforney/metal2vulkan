@@ -21,9 +21,29 @@
 //! are also an image of it over their bytes (`ycbcr_planes.rs`), which a slot whose every sample
 //! the device's sampler takes samples through the device's conversion instead of the texel
 //! buffer.
+//!
+//! **Over its planes alone** (`PlanesInPlace::later`). Metal's own YCbCr texture is the
+//! surface's planes and nothing else, where the image above is as large as the picture in halves
+//! (63 MiB for 3840 x 2160) with a staging copy of the planes beside it, kept for the texture's
+//! life, though no function that only samples it reads either. So a texture whose planes are read
+//! in place, of `ShaderRead` usage alone, whose caller asks
+//! ([`IoSurfaceYCbCr::planes_alone`](crate::IoSurfaceYCbCr::planes_alone)), is made with no
+//! image: its texels are the planes' bytes (`Storage::Texels`), and it holds what its image
+//! is made of. A slot binding that reads the planes in place binds them as before. The first slot
+//! binding that needs the image (a `read()`, a gather, a comparison, a storage binding) makes it
+//! then, as a binding beyond a texture's usage makes its shadow (`texture/usage_shadow.rs`): the
+//! same image, view and conversion as a texture made with its image, its copies listed with the
+//! bound textures' (`shadow::texture_copies`), so it converts as that texture does. Such a
+//! texture serves slot bindings alone: it takes no resource ID (no function reads it through
+//! one), makes no view, and every other call that needs its image is refused
+//! (`NotImplemented(Textures)`), which its caller answers by making the texture with its image
+//! ([`Texture::is_planes_alone`]). Its CPU copies move the luma rows, as the other's do. The
+//! textures made each way, the images made later and the bytes of the images alive are counted
+//! ([`ycbcr_surface_counts`](crate::ycbcr_surface_counts)).
 
 use super::ycbcr_planes::PlanesImage;
 use super::{image_error, IdUse, Image, Storage, Texture};
+use crate::resource_ids::IdPlacement;
 use crate::address_map::AddressModeMap;
 use crate::binding_view::VkView;
 use crate::buffer_texture::{view_usage, Texels};
@@ -56,8 +76,69 @@ use metal2vulkan::vk::{
     ImageUsageFlags, ImageViewType,
 };
 use std::ops::Range;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// The two-plane YCbCr textures over surfaces a process made and the images it holds for them
+/// (the module docs' **Over its planes alone**), for a frontend's telemetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YCbCrSurfaceCounts {
+    /// Textures made over their planes alone, with no image.
+    pub planes_alone: u64,
+    /// Textures made with their image.
+    pub with_image: u64,
+    /// Images made later for a texture over its planes alone, at a slot binding that needed one.
+    pub images_later: u64,
+    /// Images alive now, of either kind (a view's own among them).
+    pub images_alive: u64,
+    /// The bytes of device memory those images and their conversions' staging buffers hold.
+    pub image_bytes_alive: u64,
+}
+
+static PLANES_ALONE: AtomicU64 = AtomicU64::new(0);
+static WITH_IMAGE: AtomicU64 = AtomicU64::new(0);
+static IMAGES_LATER: AtomicU64 = AtomicU64::new(0);
+static IMAGES_ALIVE: AtomicU64 = AtomicU64::new(0);
+static IMAGE_BYTES_ALIVE: AtomicU64 = AtomicU64::new(0);
+
+/// The process's counts of two-plane YCbCr textures over surfaces ([`YCbCrSurfaceCounts`]).
+pub fn ycbcr_surface_counts() -> YCbCrSurfaceCounts {
+    YCbCrSurfaceCounts {
+        planes_alone: PLANES_ALONE.load(Ordering::Relaxed),
+        with_image: WITH_IMAGE.load(Ordering::Relaxed),
+        images_later: IMAGES_LATER.load(Ordering::Relaxed),
+        images_alive: IMAGES_ALIVE.load(Ordering::Relaxed),
+        image_bytes_alive: IMAGE_BYTES_ALIVE.load(Ordering::Relaxed),
+    }
+}
+
+/// A converted image alive, counted with its bytes until its copies go
+/// (`ShadowSource::Converted`).
+pub(crate) struct ImageAlive(u64);
+
+impl ImageAlive {
+    fn of(bytes: u64) -> ImageAlive {
+        IMAGES_ALIVE.fetch_add(1, Ordering::Relaxed);
+        IMAGE_BYTES_ALIVE.fetch_add(bytes, Ordering::Relaxed);
+        ImageAlive(bytes)
+    }
+}
+
+impl Drop for ImageAlive {
+    fn drop(&mut self) {
+        IMAGES_ALIVE.fetch_sub(1, Ordering::Relaxed);
+        IMAGE_BYTES_ALIVE.fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
+
+/// What the image of a texture over its planes alone is made of, at the first slot binding that
+/// needs it (the module docs): what [`Device::converted_storage`] takes.
+pub(super) struct ImageLater {
+    descriptor: TextureDescriptor,
+    layout: TextureLayout,
+    planes: YCbCrPlanes,
+    span: Range<u64>,
+}
 
 /// The formats of a texture's image and of the view the conversion writes it through, by what
 /// its texels read: the converted texels as halves, every channel a multiple of 1/2048 up to 1,
@@ -149,6 +230,9 @@ pub(crate) struct PlanesInPlace {
     pub(super) words: YCbCrInPlace,
     start: u64,
     pub(super) image: Option<Arc<PlanesImage>>,
+    /// Of a texture over its planes alone: what its image is made of once a slot binding needs
+    /// it (the module docs). `None` for a texture made with its image.
+    pub(super) later: Option<ImageLater>,
 }
 
 /// Why a two-plane YCbCr texture keeps its image alone, its planes read in place by no function
@@ -228,6 +312,7 @@ impl Device {
             words,
             start: span.start,
             image: None,
+            later: None,
         })
     }
 
@@ -236,16 +321,18 @@ impl Device {
     /// image of the texels Metal reads and the conversion (`ycbcr.rs`). It reads alpha 1 and maps
     /// the address modes Metal samples otherwise (`ycbcr_modes`). Refused `NotImplemented` where
     /// the device holds no such image, and as `new_texture` refuses the image or the view the
-    /// conversion writes it through.
+    /// conversion writes it through. Where `alone` and the texture can be, it is made over its
+    /// planes alone (the module docs), refused as the image would be.
     pub(crate) fn new_converted_texture(
         &self,
         call: &'static str,
         texels: Texels,
         descriptor: &TextureDescriptor,
         layout: &TextureLayout,
-        id_use: IdUse,
+        (id_use, alone): (IdUse, bool),
         (planes, span): (&YCbCrPlanes, Range<u64>),
     ) -> Result<Texture, Error> {
+        let asked_usage = descriptor.usage;
         let descriptor = TextureDescriptor {
             alpha_reads_one: true,
             address_mode_map: ycbcr_modes(planes.codes),
@@ -267,9 +354,31 @@ impl Device {
                     Err(kept) => counts.ycbcr_planes_image_kept(kept),
                 }
             }
+            // Over its planes alone: no image until a slot binding needs one, and no resource
+            // ID, which only a function reading handles would reach it through.
+            let alone = alone && asked_usage == TextureUsage::SHADER_READ;
+            let mut in_place = in_place.ok();
+            if let (true, Some(p)) = (alone, in_place.as_mut()) {
+                // Refused now as its image would be, which is made later.
+                self.converted_plan(call, &descriptor, layout, planes)?;
+                p.later = Some(ImageLater {
+                    descriptor,
+                    layout: *layout,
+                    planes: *planes,
+                    span,
+                });
+                PLANES_ALONE.fetch_add(1, Ordering::Relaxed);
+                let id_use = match id_use {
+                    IdUse::Program(_) => IdUse::Program(IdPlacement::Outside),
+                    IdUse::Runtime => IdUse::Runtime,
+                };
+                let made = (Storage::Texels(texels), in_place);
+                return Ok(Texture::made_with_planes(self, made, record, None, id_use));
+            }
             let storage =
                 self.converted_storage(call, texels, &descriptor, layout, (planes, span))?;
-            let made = (storage, in_place.ok());
+            WITH_IMAGE.fetch_add(1, Ordering::Relaxed);
+            let made = (storage, in_place);
             return Ok(Texture::made_with_planes(self, made, record, None, id_use));
         }
         // Over a surface of a P3 matrix: an image of the codes of the code-reading format, its
@@ -286,6 +395,7 @@ impl Device {
             .map_err(|_| internal("a P3 texture's descriptor past its own"))?;
         let storage =
             self.converted_storage(call, texels, &coded, &coded_layout, (planes, span))?;
+        WITH_IMAGE.fetch_add(1, Ordering::Relaxed);
         record.read_as = Some((
             code_format,
             over_read([S::Green, S::Blue, S::Red], descriptor.swizzle),
@@ -293,18 +403,16 @@ impl Device {
         Ok(Texture::made(self, storage, record, None, id_use))
     }
 
-    /// The storage of a two-plane YCbCr texture of `descriptor` (checked as `layout`) over
-    /// `texels`, for Metal's `call`, whose planes `planes` lie in `span` of the texels' buffer:
-    /// its image and the conversion's shadow (`new_converted_texture`, and a view as the
-    /// texture's `_sRGB` twin, `Texture::converted_view`).
-    fn converted_storage(
+    /// The plan of the image of a two-plane YCbCr texture of `descriptor` (checked as `layout`)
+    /// whose planes are `planes`, for Metal's `call`, and the format of the view the conversion
+    /// writes it through. Refused `NotImplemented` where the device holds no such image.
+    fn converted_plan(
         &self,
         call: &'static str,
-        texels: Arc<Texels>,
         descriptor: &TextureDescriptor,
         layout: &TextureLayout,
-        (planes, span): (&YCbCrPlanes, Range<u64>),
-    ) -> Result<Storage, Error> {
+        planes: &YCbCrPlanes,
+    ) -> Result<(crate::image_plan::ImagePlan, Format), Error> {
         let pf = layout.pixel_format;
         let gap =
             || Error::Unsupported(Unsupported::not_implemented(Feature::Format).naming_format(pf));
@@ -351,8 +459,29 @@ impl Device {
                 plan.view_formats.push(written);
             }
         }
+        Ok((plan, written))
+    }
+
+    /// The storage of a two-plane YCbCr texture of `descriptor` (checked as `layout`) over
+    /// `texels`, for Metal's `call`, whose planes `planes` lie in `span` of the texels' buffer:
+    /// its image and the conversion's shadow (`new_converted_texture`, and a view as the
+    /// texture's `_sRGB` twin, `Texture::converted_view`).
+    fn converted_storage(
+        &self,
+        call: &'static str,
+        texels: Arc<Texels>,
+        descriptor: &TextureDescriptor,
+        layout: &TextureLayout,
+        (planes, span): (&YCbCrPlanes, Range<u64>),
+    ) -> Result<Storage, Error> {
+        let pf = layout.pixel_format;
+        let (plan, written) = self.converted_plan(call, descriptor, layout, planes)?;
         let hazard = texels.options().hazard_tracking_mode()?;
         let image = self.new_image(plan, layout, descriptor, hazard)?;
+        let image_bytes = match &image.owner {
+            super::Owner::Runtime { placement, .. } => placement.size(),
+            _ => 0,
+        };
         // The conversion's set holds it as long as the image (`Image::own_view`).
         let view = image.own_view(&VkView {
             view_type: ImageViewType::TYPE_2D,
@@ -367,6 +496,7 @@ impl Device {
         })?;
         let (raw, at) = texels.buffer.at(span.start);
         let conversion = YCbCrConversion::new(self, (planes, span.clone()), (raw, at), view);
+        let alive = ImageAlive::of(image_bytes + conversion.staging_bytes());
         let (bytes, tracked) = texels.buffer.tracked(span);
         let copies = ShadowCopies {
             source: ShadowSource::Converted {
@@ -376,6 +506,7 @@ impl Device {
                 alias: texels.buffer.alias().map(|alias| alias.key),
                 conversion: Box::new(conversion),
                 pixel_format: pf,
+                _alive: alive,
             },
             shadow_key: image.identity.key,
             shadow_range: UseRange::Image {
@@ -404,6 +535,47 @@ impl Device {
 }
 
 impl Texture {
+    /// Whether this two-plane YCbCr texture is over its planes alone (the module docs): made with
+    /// [`IoSurfaceYCbCr::with_planes_alone`](crate::IoSurfaceYCbCr::with_planes_alone), it has
+    /// no image until a slot binding needs one, and serves slot bindings alone. Its caller makes
+    /// the texture again without that for any other call that names it.
+    pub fn is_planes_alone(&self) -> bool {
+        self.image_later().is_some()
+    }
+
+    /// What the image of a texture over its planes alone is made of (the module docs); `None`
+    /// for every other texture.
+    pub(super) fn image_later(&self) -> Option<&ImageLater> {
+        self.0.planes_in_place.as_ref()?.later.as_ref()
+    }
+
+    /// The image of a texture over its planes alone and the copies that convert the planes into
+    /// it, made at the first slot binding that needs them (`texture/usage_shadow.rs`), as
+    /// `call`'s: what a texture made with its image holds from the start. Internal for another
+    /// texture; refused as that texture's image and conversion are.
+    pub(super) fn later_image(
+        &self,
+        call: &'static str,
+    ) -> Result<(Arc<Image>, Arc<ShadowCopies>), Error> {
+        let (Some(later), Storage::Texels(texels)) = (self.image_later(), &self.0.storage) else {
+            return Err(internal(
+                "an image made later for a texture made with its image",
+            ));
+        };
+        let storage = self.device().converted_storage(
+            call,
+            Arc::clone(texels),
+            &later.descriptor,
+            &later.layout,
+            (&later.planes, later.span.clone()),
+        )?;
+        let Storage::Shadow { image, copies, .. } = storage else {
+            return Err(internal("a converted storage that is no shadow"));
+        };
+        IMAGES_LATER.fetch_add(1, Ordering::Relaxed);
+        Ok((image, copies))
+    }
+
     /// The uniform texel buffer view of the texture's planes read in place (the module docs), made
     /// at its first bind and kept with the texels. Internal for a texture whose planes are not.
     pub(crate) fn planes_view(&self) -> Result<vk::BufferView, Error> {

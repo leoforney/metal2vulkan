@@ -56,7 +56,7 @@ pub fn native(fb: &mut FunctionBuilder<'_>, f: Form, x: Value, y: Value) -> BRes
     let q = fb.binary(BinOp::FDiv, x, y)?;
     match f.float_fmt() {
         Some(FloatFmt::F32) => Ok(q),
-        Some(FloatFmt::Half) => narrow::round(fb, f, q),
+        Some(FloatFmt::Half) => narrow::round_native(fb, f, q),
         _ => Err(BuildError::Type(TypeRule::FunctionSignature)),
     }
 }

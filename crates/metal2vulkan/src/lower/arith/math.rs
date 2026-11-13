@@ -1304,10 +1304,21 @@ pub fn float_fn(
     let r = match op {
         _ if op.closed_on_narrow() => r,
         // A `half` `mix`, the device's `FMix` in `float`, rounds once.
-        F::Mix if f.float_fmt() == Some(FloatFmt::Half) => narrow::round(fb, f, r)?,
+        F::Mix if f.float_fmt() == Some(FloatFmt::Half) => narrow::round_native(fb, f, r)?,
         // Rounded per step below.
         F::Mix | F::MulAdd | F::Fract | F::FastFract => r,
-        F::Dot => narrow::round(fb, f.scalar_form(), r)?,
+        F::Dot => narrow::round_native(fb, f.scalar_form(), r)?,
+        // One device instruction on the operands: the device's own at its 16-bit precision
+        // where the module leaves `half` results to it.
+        F::Sqrt
+        | F::FastSqrt
+        | F::Rsqrt
+        | F::FastRsqrt
+        | F::Exp
+        | F::Exp2
+        | F::Log
+        | F::Log2
+        | F::FastLog2 => narrow::round_native(fb, f, r)?,
         _ => narrow::round(fb, f, r)?,
     };
     Ok(r)
@@ -1416,9 +1427,9 @@ fn float_fn_core(
         F::MulAdd => {
             // A narrow form takes the unfused choice, each step rounded once by the device.
             let p = bin(fb, BinOp::FMul, a, arg(args, 1)?)?;
-            let p = narrow::round(fb, f, p)?;
+            let p = narrow::round_native(fb, f, p)?;
             let r = bin(fb, BinOp::FAdd, p, arg(args, 2)?)?;
-            narrow::round(fb, f, r)
+            narrow::round_native(fb, f, r)
         }
         F::Sqrt => g1(fb, GlslOp::Sqrt),
         F::Fma if f.float_fmt() == Some(FloatFmt::BFloat) => {

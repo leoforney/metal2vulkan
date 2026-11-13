@@ -5053,6 +5053,16 @@ pub struct WorkCounts {
     /// Its live dedicated blocks with their placement: a placement larger than half a block, one
     /// placed apart, or an exportable buffer's dedicated allocation (`exported_memory.rs`).
     pub dedicated_memory_blocks_live: u64,
+    /// Bytes of its live pooled blocks with a placement.
+    pub pooled_memory_bytes_live: u64,
+    /// Of those, the bytes placed.
+    pub pooled_memory_bytes_used: u64,
+    /// Bytes of its empty kept pooled blocks.
+    pub empty_memory_bytes_live: u64,
+    /// Bytes of its live dedicated blocks.
+    pub dedicated_memory_bytes_live: u64,
+    /// Bytes of its live host imports.
+    pub imported_memory_bytes_live: u64,
     /// Of `pooled_memory_blocks_made`, the blocks of the pool a color texture's host-transfer
     /// image places in made ready off the program's thread: allocated and every page of their
     /// mapping read once by the host, then added to the pool by the first placement there that
@@ -8218,6 +8228,11 @@ impl Device {
             pooled_memory_blocks_made: made,
             pooled_memory_blocks_freed: freed,
             dedicated_memory_blocks_live: census.dedicated,
+            pooled_memory_bytes_live: census.pooled_bytes,
+            pooled_memory_bytes_used: census.pooled_used_bytes,
+            empty_memory_bytes_live: census.empty_bytes,
+            dedicated_memory_bytes_live: census.dedicated_bytes,
+            imported_memory_bytes_live: census.imported_bytes,
             host_copy_blocks_readied: host_copy.readied,
             host_copy_blocks_made_in_place: host_copy.made_in_place,
             buffer_blocks_made_ahead: ahead.buffers_ahead,

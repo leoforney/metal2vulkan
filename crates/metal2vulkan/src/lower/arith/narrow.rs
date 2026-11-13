@@ -133,6 +133,48 @@ pub fn round(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value> 
     }
 }
 
+/// Whether profile `p`'s modules leave the result of a `half` operation the device has an
+/// instruction for to the device's own 16-bit precision ([`round_native`]): a profile with
+/// `shaderFloat16` whose 16-bit floats do not keep denormals (no `DenormPreserve` for 16 bits, so
+/// no float controls make its conversion Metal's and the module rounds in
+/// [`QuantizeForm::Converted`]) and whose conversion and 16-bit arithmetic no measurement
+/// makes Metal's (`DriverDeviation::MetalHalfConversion`, `MetalHalfArithmetic`: MoltenVK's stay
+/// as they are), under `HalfChainPolicy::AtExits` (the default).
+/// `HalfChainPolicy::EachOperation` (`DevicePolicy::exact_answers`) keeps the conversion pair
+/// after every operation.
+pub fn relaxes(p: &DeviceProfile) -> bool {
+    let fields = p.fields();
+    // A device whose conversion or 16-bit arithmetic is measured to be Metal's keeps it.
+    let measured = p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfConversion)
+        || p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfArithmetic);
+    fields.half_chains == crate::device::HalfChainPolicy::AtExits
+        && !measured
+        && fields.leaf.float16
+        && !fields.float_controls.f16.denorm_preserve
+        && quantize_form(p) == QuantizeForm::Converted
+}
+
+/// [`round`] of `x`, the result of ONE device instruction on `half` operands held widened (a
+/// `half` `+ - * /`, `fma`, `dot`, `mix`, or a function the device has an instruction for).
+/// Where the module leaves such results to the device (`ModuleBuilder::relaxed_half`,
+/// [`relaxes`]) the result is `x` itself, recorded for the serializer to decorate
+/// `RelaxedPrecision`: the device computes the instruction at its 16-bit precision, on its
+/// 16-bit registers, in place of computing it in `float` and converting to 16 bits and back (a
+/// pair Mesa's compiler folds into nothing, the result then not rounded at all). Recorded as
+/// `PrecisionNote::NativeHalfConversion`. A `half` a routine of several instructions computes in
+/// `float`, a conversion from `float` and a texel are not this form: they take [`round`] and
+/// [`round_measured`], whose operand may be a `float` the function also reads at full precision.
+pub fn round_native(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value> {
+    if f.held == Held::Float(FloatFmt::Half)
+        && fb.module().relaxed_half()
+        && fb.module().quantize_form() == QuantizeForm::Converted
+    {
+        fb.module().note_relaxed(x);
+        return Ok(x);
+    }
+    round(fb, f, x)
+}
+
 /// How profile `p`'s modules round an `f32` to `half` ([`QuantizeForm`]): the device's conversion
 /// to 16 bits and back under the float controls that make it Metal's by the Vulkan spec where the
 /// profile has `shaderFloat16` and them ([`QuantizeForm::Controlled`], [`controlled_modes`]), else

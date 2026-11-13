@@ -102,7 +102,7 @@ enum ImageFormat
 values *
 
 enum Decoration
-values SpecId Block ColMajor ArrayStride MatrixStride BuiltIn NoPerspective Flat Patch Centroid
+values RelaxedPrecision SpecId Block ColMajor ArrayStride MatrixStride BuiltIn NoPerspective Flat Patch Centroid
 values Sample Invariant Aliased Volatile Coherent NonWritable Location Component Index Binding
 values DescriptorSet Offset NoContraction InputAttachmentIndex PerPrimitiveEXT NonUniform
 values AliasedPointer

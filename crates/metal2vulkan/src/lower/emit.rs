@@ -105,6 +105,7 @@ fn declare(mb: &mut ModuleBuilder, plan: &Plan) -> BResult<Declared> {
     // And every `half` rounding's quantize the device's form.
     mb.set_quantize_form(plan.families.arith.quantize);
     mb.set_native_half(plan.families.arith.native_half);
+    mb.set_relaxed_half(plan.families.arith.relaxed_half);
     mb.set_native_half_nans(plan.families.arith.native_half_nans);
     let mut d = Declared::default();
     let modes = &mut d.modes;

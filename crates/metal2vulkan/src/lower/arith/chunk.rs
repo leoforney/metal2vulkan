@@ -413,7 +413,7 @@ pub fn dot(
         });
     }
     let sum = sum.ok_or_else(operand_error)?;
-    narrow::round(fb, elem, sum)
+    narrow::round_native(fb, elem, sum)
 }
 
 /// The words of [`dot`] on `lanes` lanes of `elem`.

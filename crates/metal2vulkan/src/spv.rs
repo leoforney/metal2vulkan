@@ -5841,6 +5841,7 @@ pub enum ImageFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Decoration {
+    RelaxedPrecision = 0,
     SpecId = 1,
     Block = 2,
     ColMajor = 5,

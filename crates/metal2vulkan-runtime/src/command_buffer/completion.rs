@@ -724,6 +724,11 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
         } = batch;
         lists.gathered.extend(fence.map(|fence| (queue, fence)));
         if last {
+            crate::stage_trace::mark(
+                Arc::as_ptr(&*buffer) as usize,
+                crate::stage_trace::Stage::Seen,
+                queue.min(255) as u32,
+            );
             let mut state = lock(&buffer.state);
             state.times.completed = seen;
             state.keep_holds(holds);
@@ -1113,6 +1118,8 @@ struct Front {
     value: u64,
     /// The fence its submission signals, where it has one.
     fence: Option<vk::Fence>,
+    /// Its command buffer, for the stage trace (`stage_trace.rs`).
+    id: usize,
 }
 
 /// `VkQueue` `queue`'s waiter (the module docs): it waits for its queue's first pending batch
@@ -1148,6 +1155,7 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
                         let front = Front {
                             value: batch.value,
                             fence: batch.fence,
+                            id: Arc::as_ptr(&*batch.buffer) as usize,
                         };
                         Some((front, batch.buffer.device().clone()))
                     }
@@ -1169,11 +1177,18 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
             continue;
         };
         device.shared().counts.completion_armed(slept);
+        crate::stage_trace::mark(
+            front.id,
+            crate::stage_trace::Stage::PollArmed,
+            (queue.min(255) as u32) | (u32::from(slept) << 8),
+        );
         // The wait is a section of the exit guard; once the process is exiting the waiters end,
         // and what is pending stays pending, as Metal's does.
         let polled = match exit_guard::enter() {
             Some(busy) => {
+                let id = front.id;
                 let polled = poll(&device, queue, front);
+                crate::stage_trace::mark(id, crate::stage_trace::Stage::PollDone, queue.min(255) as u32);
                 drop(busy);
                 Some(polled)
             }
@@ -1360,6 +1375,7 @@ pub(crate) fn seen<E>(
 }
 
 /// The command-buffer error of a failed wait, recording a lost device.
+#[track_caller]
 fn failure(device: &Device, error: vk::Result) -> CommandBufferError {
     match error {
         vk::Result::ERROR_DEVICE_LOST => {

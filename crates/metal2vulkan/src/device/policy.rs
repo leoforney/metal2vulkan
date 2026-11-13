@@ -327,13 +327,26 @@ pub enum HostPageTexturePolicy {
     /// texels into before each use and merge back after each write, whose copies touch the
     /// texels alone.
     Shadow,
+    /// [`InPlace`](Self::InPlace) for every usage, a texture that renders or writes too, with no
+    /// check run and no verdict waited for, trusting the driver to touch no byte beside the
+    /// texels: a window server's surfaces, which it renders into each frame, are otherwise copied
+    /// into a shadow before each pass and merged back after it. A padded texture over a buffer of
+    /// the runtime's own memory aliases its bytes too, a written one where its tile stores stay
+    /// within its rows (`linear_plan::tile_store_fits`), where the device lays it out at the
+    /// buffer's row pitch.
+    InPlaceWrites,
 }
 
 /// How a chain of `half` additions, subtractions and products rounds on a device without
 /// `shaderFloat16`, where a module computes each in `float` on its operands held widened and
 /// rounds its result by the device's `OpQuantizeToF16` (`PrecisionNote::NativeHalfQuantize`):
-/// capability emulation, as the device has no 16-bit arithmetic. A device with `shaderFloat16`
-/// computes `half` as it does under either value. Changes emitted code: the profile carries it.
+/// capability emulation, as the device has no 16-bit arithmetic. On a device with `shaderFloat16`
+/// whose 16-bit floats keep no denormals (no `DenormPreserve` for 16 bits) it chooses how a `half`
+/// operation the device has an instruction for is stated: its `float` result decorated
+/// `RelaxedPrecision`, the device's own 16-bit precision (`AtExits`), or the operation in `float`
+/// converted to 16 bits and back (`EachOperation`); `PrecisionNote::NativeHalfConversion` either
+/// way. Every other device with `shaderFloat16` computes `half` as it does under either value.
+/// Changes emitted code: the profile carries it.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

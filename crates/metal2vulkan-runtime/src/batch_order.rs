@@ -23,6 +23,13 @@
 //! - RADV (Mesa 26.0.8) on the Radeon 780M and the RX 7900 XTX;
 //! - NVIDIA's driver (615.71.09) on the RTX 5080 Laptop GPU.
 //!
+//! Turnip on an Adreno runs them so by construction, read in its source and not measured: the GPU
+//! has one command processor, which executes a ring's indirect buffers in the order the kernel
+//! wrote them, and Turnip gives each `VkQueue` one kernel submit queue whose submissions go to
+//! one ring in submission order (Mesa's `tu_queue.cc`, `tu_queue_submit` to
+//! `tu_knl::queue_submit`; `drm/msm`'s `msm_gpu_submit`, or a port's own kernel driver behind
+//! `tu_knl`). No two submissions of a queue overlap there, with or without a barrier.
+//!
 //! On those drivers ([`ends_order`]) the default form orders batches by their ends: every batch
 //! ends with [`Barrier::to_all`], every write before every access of every later command of its
 //! `VkQueue`, so the tracker plans no barrier after an access of an earlier batch there
@@ -50,7 +57,12 @@ pub(crate) fn by_ends(policy: &DevicePolicy, driver: Option<DriverId>) -> bool {
 fn ends_order(driver: Option<DriverId>) -> bool {
     matches!(
         driver,
-        Some(DriverId::INTEL_OPEN_SOURCE_MESA | DriverId::MESA_RADV | DriverId::NVIDIA_PROPRIETARY)
+        Some(
+            DriverId::INTEL_OPEN_SOURCE_MESA
+                | DriverId::MESA_RADV
+                | DriverId::NVIDIA_PROPRIETARY
+                | DriverId::MESA_TURNIP
+        )
     )
 }
 

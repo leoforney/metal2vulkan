@@ -76,30 +76,47 @@ pub(crate) struct Directory {
     root: PathBuf,
     build: Hash256,
     capacity: u64,
+    /// Its directories and entries are made readable by everyone (`system.rs`): the directory
+    /// of the process that fills the system layer.
+    public: bool,
 }
 
 impl Directory {
     /// Open `root` for `build` with a cap of `capacity` bytes: create it and the build's
     /// directory (owner-only) and write and remove a probe file there. The error names the
     /// directory that failed.
+    ///
+    /// With `METAL2VULKAN_SHADER_CACHE_OPTIONAL` in the environment a directory that cannot be
+    /// made or written opens anyway: a process that may write nowhere (a sandboxed one, as
+    /// WebKit's GPU process) still gets its device, and every read and write of the cache is a
+    /// miss, as after any later failure.
     pub(crate) fn open(root: PathBuf, build: Hash256, capacity: u64) -> Result<Directory, Failed> {
         let directory = Directory {
             root,
             build,
             capacity,
+            public: super::system::cache_readable_by_all(),
         };
         let failed = |path: &Path| {
             let path = path.to_path_buf();
             move |error| Failed { path, error }
         };
-        create_private_dir_all(&directory.root).map_err(failed(&directory.root))?;
-        let build_dir = directory.build_dir();
-        create_private_dir_all(&build_dir).map_err(failed(&build_dir))?;
-        let probe = build_dir.join(format!(".probe.{}.tmp", unique()));
-        let written = new_private_file(&probe).and_then(|mut file| file.write_all(b"probe"));
-        let removed = fs::remove_file(&probe);
-        written.and(removed).map_err(failed(&directory.root))?;
-        Ok(directory)
+        let made = (|| {
+            directory.create_dir_all(&directory.root).map_err(failed(&directory.root))?;
+            let layout_dir = directory.layout_dir();
+            directory.create_dir_all(&layout_dir).map_err(failed(&layout_dir))?;
+            let build_dir = directory.build_dir();
+            directory.create_dir_all(&build_dir).map_err(failed(&build_dir))?;
+            let probe = build_dir.join(format!(".probe.{}.tmp", unique()));
+            let written = directory.new_file(&probe).and_then(|mut file| file.write_all(b"probe"));
+            let removed = fs::remove_file(&probe);
+            written.and(removed).map_err(failed(&directory.root))
+        })();
+        match made {
+            Err(_) if std::env::var_os("METAL2VULKAN_SHADER_CACHE_OPTIONAL").is_some() => Ok(directory),
+            Err(failed) => Err(failed),
+            Ok(()) => Ok(directory),
+        }
     }
 
     /// The directory the consumer named or the platform's default.
@@ -120,6 +137,41 @@ impl Directory {
     /// `<root>/v1/<build>`.
     fn build_dir(&self) -> PathBuf {
         self.layout_dir().join(hex(&self.build))
+    }
+
+    /// Create `dir` and its missing parents: each only its owner may enter, or, in a directory
+    /// made for every reader (`system.rs`), everyone may read and enter, whatever the process's
+    /// file mode mask says.
+    fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        if !self.public {
+            return create_private_dir_all(dir);
+        }
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            builder.mode(0o755);
+            builder.create(dir)?;
+            if fs::metadata(dir)?.permissions().mode() & 0o777 != 0o755 {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        builder.create(dir)
+    }
+
+    /// Create the new file `path`, which only its owner may read, or everyone in a directory
+    /// made for every reader; fails if it exists.
+    fn new_file(&self, path: &Path) -> io::Result<fs::File> {
+        let file = new_private_file(path)?;
+        #[cfg(unix)]
+        if self.public {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
+        Ok(file)
     }
 
     /// The path of the entry named `name`.
@@ -193,6 +245,9 @@ enum Found {
     Bytes(Vec<u8>, fs::File),
     /// The entry's bytes, from a write the cache thread has not made yet: no file to refresh.
     Queued(Vec<u8>),
+    /// The entry's bytes, from the system layer (`system.rs`): not this directory's to refresh
+    /// or remove.
+    System(Vec<u8>),
 }
 
 /// The counts behind [`ShaderCacheStatistics`](super::ShaderCacheStatistics).
@@ -328,11 +383,16 @@ pub(crate) struct Store {
     used: AtomicU64,
     /// A scan has set `used`; before that the cap is not judged.
     scanned: AtomicBool,
+    /// The platform refused this process an entry's access time ([`Store::accepted`]): its hits
+    /// ask for none from then on.
+    touch_refused: AtomicBool,
     /// The warnings said once each ([`Warnings`]).
     warnings: Warnings,
     /// The device's cache thread, which writes the entries this store is given; `None` in a
     /// store with no thread, which writes them on the calling thread.
     asked: Option<Arc<Asked>>,
+    /// The system layer this store asks for what its directory lacks (`system.rs`).
+    system: Option<Arc<super::system::SystemLayer>>,
 }
 
 /// What a device's store says once each, through its instance's message sink, else on stderr:
@@ -362,13 +422,22 @@ impl Store {
             counters: Counters::default(),
             used: AtomicU64::new(0),
             scanned: AtomicBool::new(false),
+            touch_refused: AtomicBool::new(false),
             warnings: Warnings {
                 sink,
                 evicted: AtomicBool::new(false),
                 write_failed: AtomicBool::new(false),
             },
             asked,
+            system: super::system::system_layer(),
         }
+    }
+
+    /// The system layer's bytes of the file this directory would hold at `path`.
+    fn system_read(&self, path: &Path) -> Option<Vec<u8>> {
+        let system = self.system.as_ref()?;
+        let relative = path.strip_prefix(self.directory.root()).ok()?;
+        system.read(relative, self.entry_limit())
     }
 
     /// Count an entry not written (`ShaderCacheStatistics::write_failures`); the first is
@@ -460,6 +529,10 @@ impl Store {
         count(&self.counters.holds_questions);
         timed(&self.counters.read_nanos, || {
             fs::metadata(path).is_ok_and(|metadata| metadata.len() <= self.entry_limit())
+                || self.system.as_ref().is_some_and(|system| {
+                    path.strip_prefix(self.directory.root())
+                        .is_ok_and(|relative| system.holds(relative, self.entry_limit()))
+                })
         })
     }
 
@@ -499,6 +572,10 @@ impl Store {
             }
             Found::Bytes(bytes, file) => (bytes, Some(file)),
             Found::Queued(bytes) => (bytes, None),
+            Found::System(bytes) => {
+                let length = bytes.len() as u64;
+                return self.system_verdict(decode(bytes), length);
+            }
         };
         match decode(bytes) {
             Some(value) => {
@@ -507,6 +584,23 @@ impl Store {
             }
             None => {
                 self.refused(&path);
+                Lookup::Rejected
+            }
+        }
+    }
+
+    /// What a decoder made of `length` bytes the system layer gave: counted there, and a
+    /// refusal in this store's rejections too. Nothing is touched or removed.
+    fn system_verdict<T>(&self, decoded: Option<T>, length: u64) -> Lookup<T> {
+        let system = self.system.as_ref().expect("bytes of the system layer");
+        match decoded {
+            Some(value) => {
+                system.accepted(length);
+                Lookup::Hit(value)
+            }
+            None => {
+                system.rejected();
+                count(&self.counters.rejected);
                 Lookup::Rejected
             }
         }
@@ -522,6 +616,9 @@ impl Store {
             }
             Found::Bytes(bytes, file) => (bytes, Some(file)),
             Found::Queued(bytes) => (bytes, None),
+            Found::System(bytes) => {
+                return self.system_verdict(decode(&bytes).ok(), bytes.len() as u64);
+            }
         };
         match decode(&bytes) {
             Ok(value) => {
@@ -537,9 +634,19 @@ impl Store {
 
     /// The contents a decoder accepted: a hit from `file` makes its entry the most recently used;
     /// a hit from the queue (no file) is counted as one the directory had not written yet.
+    ///
+    /// A process whose sandbox lets it read and add entries may still be refused their
+    /// attributes: macOS's `iconservicesagent` was, at every hit, and each refusal is a sandbox
+    /// violation the kernel logs (39133 of a boot's 45648). The first such refusal is the last
+    /// asked: the entries this process hits keep the access time their readers leave them.
     fn accepted(&self, file: Option<&fs::File>) {
         match file {
-            Some(file) => timed(&self.counters.read_nanos, || touch(file)),
+            Some(_) if self.touch_refused.load(Ordering::Relaxed) => {}
+            Some(file) => {
+                if timed(&self.counters.read_nanos, || touch(file)) {
+                    self.touch_refused.store(true, Ordering::Relaxed);
+                }
+            }
             None => count(&self.counters.queued_hits),
         }
     }
@@ -570,7 +677,19 @@ impl Store {
             return Found::Queued(bytes);
         }
         count(&self.counters.entry_reads);
-        timed(&self.counters.read_nanos, || {
+        timed(&self.counters.read_nanos, || match self.read_own(path) {
+            // What this directory lacks or cannot give, the system layer may hold.
+            found @ (Found::Absent | Found::Failed) => match self.system_read(path) {
+                Some(bytes) => Found::System(bytes),
+                None => found,
+            },
+            found => found,
+        })
+    }
+
+    /// [`Store::read`] of this directory's own file at `path`.
+    fn read_own(&self, path: &Path) -> Found {
+        {
             let file = match fs::File::open(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Found::Absent,
@@ -593,7 +712,7 @@ impl Store {
                 }
                 Err(_) => Found::Failed,
             }
-        })
+        }
     }
 
     /// Give `bytes` to the cache thread to write as the entry named `name` (`worker.rs`): the
@@ -654,10 +773,10 @@ impl Store {
             return Err(io::Error::other("the entry is larger than the cache takes"));
         }
         let parent = path.parent().expect("an entry has a directory");
-        create_private_dir_all(parent)?;
+        self.directory.create_dir_all(parent)?;
         let temporary = parent.join(format!(".{name}.{}.tmp", unique()));
         let written = (|| {
-            let mut file = new_private_file(&temporary)?;
+            let mut file = self.directory.new_file(&temporary)?;
             file.write_all(bytes)?;
             drop(file);
             fs::rename(&temporary, path)?;
@@ -849,8 +968,10 @@ fn last_use(metadata: &fs::Metadata) -> SystemTime {
 }
 
 /// Refresh `file`'s access time: a hit makes its entry the most recently used. Best effort.
-fn touch(file: &fs::File) {
-    let _ = file.set_times(fs::FileTimes::new().set_accessed(SystemTime::now()));
+/// Whether the platform refused this process the change (`EPERM`, `EACCES`).
+fn touch(file: &fs::File) -> bool {
+    let set = file.set_times(fs::FileTimes::new().set_accessed(SystemTime::now()));
+    set.is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
 }
 
 /// A name no other writer uses: this process's id, a per-process sequence number, and the time.

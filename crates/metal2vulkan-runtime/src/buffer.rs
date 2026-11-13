@@ -2942,6 +2942,15 @@ impl Device {
         taken
     }
 
+    /// Let the parked buffers go whose time is up, or every one where `all` (`Recycler::aged`):
+    /// how many went.
+    pub(super) fn age_parked_buffers(&self, all: bool) -> usize {
+        let gone = lock(&self.shared().recycled_buffers).aged(Instant::now(), all);
+        let count = gone.len();
+        self.let_go_parked_buffers(gone);
+        count
+    }
+
     /// Destroy the parked buffers the recycler let go of, `gone`, and free their memory.
     fn let_go_parked_buffers(&self, gone: recycle::Gone<vk::Buffer>) {
         if gone.is_empty() {

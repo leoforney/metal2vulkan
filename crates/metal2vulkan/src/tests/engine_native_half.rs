@@ -1001,3 +1001,62 @@ fn a_half_read_from_memory_is_the_devices_widening_on_every_profile() {
     }
     assert_eq!(forms.len(), 3, "a profile of each form: {forms:?}");
 }
+
+/// The `OpDecorate`s of `RelaxedPrecision` in `words`.
+fn relaxed_decorations(words: &[u32]) -> usize {
+    let mut at = 5;
+    let mut n = 0;
+    while let Some(first) = words.get(at) {
+        let (count, op) = ((first >> 16) as usize, first & 0xFFFF);
+        // OpDecorate %target RelaxedPrecision
+        if op == 71 && words.get(at + 2) == Some(&0) {
+            n += 1;
+        }
+        at += count.max(1);
+    }
+    n
+}
+
+/// On lavapipe (`shaderFloat16`, no `DenormPreserve` for 16 bits, no measured conversion) a `half`
+/// sum is left to the device's own 16-bit precision by default: its `float` result is decorated
+/// `RelaxedPrecision` and no conversion pair rounds it, recorded `NativeHalfConversion`
+/// (`narrow::round_native`). Under `exact_answers` (`HalfChainPolicy::EachOperation`) the sum
+/// keeps its conversion to 16 bits and back and nothing is decorated. A conversion from `float`
+/// alone is never decorated, under either policy: its operand is a `float` the function holds.
+/// MoltenVK, whose conversion is measured to be Metal's, and RADV, whose float controls make it
+/// so, decorate nothing.
+#[test]
+fn a_half_operation_is_the_devices_16_bit_one_by_default_without_denorm_preserve() {
+    let Some(bc) = bitcode() else {
+        return;
+    };
+    let exact = DevicePolicy::default().exact_answers();
+    let fast = profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let kept = profile("lavapipe", exact).expect("profile");
+    assert!(crate::lower::arith::narrow::relaxes(&fast));
+    assert!(!crate::lower::arith::narrow::relaxes(&kept));
+    let sum = compile(&bc, "half_sum", &fast).expect("half_sum");
+    link_and_validate(&sum, &fast).expect("L3");
+    assert_eq!(relaxed_decorations(&sum.module.words), 1);
+    assert!(sum.precision.contains(&PrecisionNote::NativeHalfConversion));
+    // The two `fptrunc`s keep their pairs; the sum has none.
+    let (r, k) = (
+        rounding(&sum.module.words),
+        rounding(&compile(&bc, "half_sum", &kept).expect("kept").module.words),
+    );
+    assert_eq!((r.narrowings, k.narrowings), (2, 3));
+    assert_eq!(
+        relaxed_decorations(&compile(&bc, "half_sum", &kept).expect("kept").module.words),
+        0
+    );
+    for p in [&fast, &kept] {
+        let narrow = compile(&bc, "half_narrow", p).expect("half_narrow");
+        assert_eq!(relaxed_decorations(&narrow.module.words), 0);
+    }
+    for stem in ["moltenvk-m3", "amd-780m-radv", "swiftshader"] {
+        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        assert!(!crate::lower::arith::narrow::relaxes(&p), "{stem}");
+        let a = compile(&bc, "half_sum", &p).expect(stem);
+        assert_eq!(relaxed_decorations(&a.module.words), 0, "{stem}");
+    }
+}

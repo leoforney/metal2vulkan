@@ -85,7 +85,10 @@ use super::image_plan::{
 };
 use super::in_place::{self, PagesClass, Refusal, ShadowCause, Verdict};
 use super::key_hash::KeyMap;
-use super::linear_plan::{aliases, check_linear_limits, linear_lack, LinearImage, LinearLack};
+use metal2vulkan::device::HostPageTexturePolicy;
+use super::linear_plan::{
+    aliases, check_linear_limits, linear_lack, tile_store_fits, LinearImage, LinearLack,
+};
 use super::memory::{BoundMemory, MemoryClass, Placement, FD_BLOCKS_HANDLE};
 use super::nan_clear;
 use super::neutral::Neutrals;
@@ -187,7 +190,8 @@ pub(super) mod wrapped;
 mod ycbcr_image;
 mod ycbcr_planes;
 pub(crate) use decoded_twin::TwinRead;
-pub(crate) use ycbcr_image::{KeptImage, PlanesInPlace};
+pub use ycbcr_image::{ycbcr_surface_counts, YCbCrSurfaceCounts};
+pub(crate) use ycbcr_image::{ImageAlive, KeptImage, PlanesInPlace};
 pub(crate) use ycbcr_planes::KeptTexels;
 
 pub(crate) use attached_reads::feedback_candidate;
@@ -2504,6 +2508,32 @@ impl Device {
                 self.host_shadowed(shadowed, (usage, &plan), descriptor, pending)?
             }
             Route::Device { holds } => {
+                // Rows that lie apart alias the buffer's bytes, written too, under
+                // `HostPageTexturePolicy::InPlaceWrites`: the bytes between them are no texel's,
+                // and a program that pads its framebuffers (a window server's) keeps nothing
+                // there. A written texture's tile stores must stay within its rows
+                // (`linear_plan::tile_store_fits`). Rows that share bytes stay refused.
+                let policy = self.compile_device().policy().host_page_textures;
+                let writes = usage.intersects(
+                    TextureUsage::RENDER_TARGET
+                        | TextureUsage::SHADER_WRITE
+                        | TextureUsage::SHADER_ATOMIC,
+                );
+                let holds = match holds {
+                    Err(_)
+                        if policy == HostPageTexturePolicy::InPlaceWrites
+                            && texels.layout.shared_bytes() == 0
+                            && (!writes
+                                || tile_store_fits(
+                                    &texels.layout,
+                                    u64::from(layout.extent[0]),
+                                    texels.buffer.length(),
+                                )) =>
+                    {
+                        Ok(())
+                    }
+                    holds => holds,
+                };
                 let over = (&*texels, &holds, usage);
                 match self.alias_over_device(&plan, (descriptor, layout), over, &facts)? {
                     Ok((image, count)) => {
@@ -3886,6 +3916,15 @@ impl Device {
         Ok((raw, placement))
     }
 
+    /// Let the parked images go whose time is up, or every one where `all` (`Recycler::aged`):
+    /// how many went.
+    pub(super) fn age_parked_images(&self, all: bool) -> usize {
+        let gone = lock(&self.shared().textures.recycled).aged(Instant::now(), all);
+        let count = gone.len();
+        self.let_go_parked(gone);
+        count
+    }
+
     /// Destroy the parked images the recycler let go of, `gone`.
     fn let_go_parked(&self, gone: recycle::Gone<vk::Image>) {
         if gone.is_empty() {
@@ -5205,10 +5244,13 @@ impl Texture {
         }
     }
 
-    /// The buffer's bytes a texture buffer is, or `None` for a texture with an image.
+    /// The buffer's bytes a texture buffer is, or `None` for a texture with an image, and for a
+    /// two-plane YCbCr texture over its planes alone (`texture/ycbcr_image.rs`), whose texels
+    /// are the planes' bytes and which binds as a texture, not as a texture buffer.
     pub(super) fn texels(&self) -> Option<&Texels> {
         match self.storage() {
             Storage::Image(_) | Storage::Alias { .. } | Storage::Shadow { .. } => None,
+            Storage::Texels(_) if self.image_later().is_some() => None,
             Storage::Texels(texels) => Some(texels),
         }
     }
@@ -6089,6 +6131,30 @@ impl Texture {
         self.heap_place().map(|place| place.size)
     }
 
+    /// The bytes placed for this texture's backing image, for a native frontend's
+    /// `MTLResource.allocatedSize` accounting. This reports Vulkan storage rather
+    /// than Apple's texture layout. Heap textures use their allocated range;
+    /// buffer textures share their buffer's length. Unowned and sparse images
+    /// return zero because their allocation is not owned by this texture.
+    pub fn backing_allocation_size(&self) -> u64 {
+        if let Some(size) = self.allocated_size() {
+            return size;
+        }
+        if let Some(texels) = self.buffer_texels() {
+            return texels.buffer.length();
+        }
+        let Ok(image) = self.image() else {
+            return 0;
+        };
+        match &image.owner {
+            Owner::Runtime { placement, .. } => placement.size(),
+            Owner::HeapShadow(shadow) => shadow.placement.size(),
+            Owner::HeapUnaliased(unaliased) => unaliased.placement.size(),
+            Owner::ViewShadow(shadow) => shadow.placement.size(),
+            _ => 0,
+        }
+    }
+
     /// `makeAliasable`: a heap texture's bytes may be another resource's from now on. An
     /// automatic heap gives its range to the next resource it places; a placement heap's texture
     /// is aliasable from the start, so nothing changes. Using the texture after is the program's
@@ -6372,6 +6438,11 @@ impl Texture {
         placement: IdPlacement,
     ) -> Result<Texture, Error> {
         self.check_viewable(call)?;
+        // A two-plane YCbCr texture over its planes alone makes no view: its caller views the
+        // texture made with its image (`texture/ycbcr_image.rs`).
+        if self.image_later().is_some() {
+            return Err(Error::NotImplemented(RuntimeGap::Textures));
+        }
         self.device().check_texture_placement(
             call,
             placement,

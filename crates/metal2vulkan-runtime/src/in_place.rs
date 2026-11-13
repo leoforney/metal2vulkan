@@ -802,6 +802,10 @@ pub(crate) fn in_place(
     if policy == HostPageTexturePolicy::Shadow {
         return Err(ShadowCause::Exact);
     }
+    // Trusting the driver for every usage (`HostPageTexturePolicy::InPlaceWrites`): no check.
+    if policy == HostPageTexturePolicy::InPlaceWrites {
+        return Ok(());
+    }
     let written = Access::written(texel, padding);
     if Access::Writes.takes(usage) && written.is_none() {
         return Err(ShadowCause::StoreWidth(texel));

@@ -424,6 +424,30 @@ impl CommandBufferShared {
         scheduler: &mut scheduler::State,
     ) -> Result<Submitting, CommandBufferError> {
         let _for = self.notices_for();
+        let id = Arc::as_ptr(self) as usize;
+        let at = (index.min(0x7fff) as u32) | (u32::from(last) << 15);
+        crate::stage_trace::mark(id, crate::stage_trace::Stage::SubmitBegin, at);
+        let submitted = self.submit_batch_now(index, last, event_waits, alone, scheduler);
+        let outcome = match &submitted {
+            Ok(Submitting::Submitted(_)) => 0,
+            Ok(Submitting::Grouped) => 1,
+            Ok(Submitting::Later) => 2,
+            Ok(Submitting::AfterGroup(_)) => 3,
+            Err(_) => 4,
+        };
+        crate::stage_trace::mark(id, crate::stage_trace::Stage::SubmitEnd, outcome);
+        submitted
+    }
+
+    /// [`submit_batch`](Self::submit_batch) itself.
+    fn submit_batch_now(
+        self: &Arc<Self>,
+        index: usize,
+        last: bool,
+        event_waits: &[(vk::Semaphore, u64)],
+        alone: bool,
+        scheduler: &mut scheduler::State,
+    ) -> Result<Submitting, CommandBufferError> {
         let device = &self.device;
         if device.is_lost() {
             return Err(CommandBufferError::DeviceLost);
@@ -547,6 +571,7 @@ impl CommandBufferShared {
         };
         // The scrubs of emulated textures' writes, as mapped now, then every segment in its place.
         self.record_scrubs(&mut state, range.clone())?;
+        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 1);
         state
             .place(range.clone())
             .map_err(|error| recording_error(device, error))?;
@@ -753,11 +778,8 @@ impl CommandBufferShared {
             barriers.first().is_some_and(Option::is_some) || !held_moves.transitions(0).is_empty();
         if entry.is_some() {
             started = true;
-            let globals: Vec<Barrier> = completed_barrier
-                .take()
-                .into_iter()
-                .chain(entry_barrier)
-                .collect();
+            let (pair, count) = barrier_pair(completed_barrier.take(), entry_barrier);
+            let globals = &pair[..count];
             let stamps = Stamps {
                 start: start_stamp.filter(|_| !encoder_behind),
                 after: entry_barrier.is_some(),
@@ -766,7 +788,7 @@ impl CommandBufferShared {
             if stamps.start.is_some() {
                 start_stamp = None;
             }
-            work.push(self.record_barriers(&mut state, &globals, &entries, stamps)?);
+            work.push(self.record_barriers(&mut state, globals, &entries, stamps)?);
         }
         for (offset, barrier) in barriers.iter().enumerate() {
             let moves = held_moves.transitions(offset);
@@ -781,11 +803,8 @@ impl CommandBufferShared {
                 work.extend(&part.raws);
                 continue;
             }
-            let globals: Vec<Barrier> = completed_barrier
-                .take()
-                .into_iter()
-                .chain(*barrier)
-                .collect();
+            let (pair, count) = barrier_pair(completed_barrier.take(), *barrier);
+            let globals = &pair[..count];
             if !globals.is_empty() || start_stamp.is_some() || !moves.is_empty() {
                 started |= offset == 0;
                 let stamps = Stamps {
@@ -794,7 +813,7 @@ impl CommandBufferShared {
                     end: None,
                 };
                 let kept = &mut scheduler.kept;
-                work.push(self.barrier_buffer(&mut state, kept, at, &globals, moves, stamps)?);
+                work.push(self.barrier_buffer(&mut state, kept, at, globals, moves, stamps)?);
             }
             work.extend(&state.recorded[start + offset].raws);
         }
@@ -1024,6 +1043,9 @@ impl CommandBufferShared {
                 false => work.insert(0, lead),
             }
         }
+        for command in work.iter().chain(finale.iter()) {
+            crate::stage_trace::diagnostic_link(Arc::as_ptr(self) as u64, ash::vk::Handle::as_raw(*command), index as u64);
+        }
         let mut work_timeline = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(wait_values)
             .signal_semaphore_values(work_signal_values);
@@ -1067,6 +1089,7 @@ impl CommandBufferShared {
         let buffers = (submits.iter())
             .map(|info| info.command_buffer_count as usize)
             .sum();
+        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 2);
         // From here its heap set versions may be pending: nothing writes them any more, and its
         // first batch takes the ticket a texture that goes from now on waits for
         // (`heap_sets.rs`). One committed and not yet submitted holds no gone texture.
@@ -1128,6 +1151,7 @@ impl CommandBufferShared {
                 scheduler
                     .group
                     .submit(device, &mut scheduler.waited[queue], Some(after));
+            crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 3);
             // A test's stand-in for a scheduler thread preempted once the call returned.
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
             super::completion::trace::submit_returned();
@@ -1277,6 +1301,7 @@ impl CommandBufferShared {
             finishes_after(&batches.all()[index].waits, (queue, self), waited)
         };
         drop(state);
+        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 4);
         if rebound {
             device.degrade_encoded_use_rebound(rebound_use);
         }
@@ -1805,4 +1830,16 @@ fn finishes_after(
         }
     }
     after
+}
+
+/// `lead` then `barrier`, those of them there are, as the first `.1` of the array: the globals
+/// of a barrier between a batch's encoders, which takes no allocation.
+fn barrier_pair(lead: Option<Barrier>, barrier: Option<Barrier>) -> ([Barrier; 2], usize) {
+    let mut pair = [Barrier::default(); 2];
+    let mut count = 0;
+    for b in lead.into_iter().chain(barrier) {
+        pair[count] = b;
+        count += 1;
+    }
+    (pair, count)
 }

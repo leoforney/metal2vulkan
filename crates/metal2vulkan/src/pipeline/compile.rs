@@ -2808,9 +2808,13 @@ fn compile_kept<K>(
     // Metal's (`DriverDeviation::MetalHalfConversion`) and every such rounding is of a form the
     // measurement covers (a `float` the function converts, or an image instruction's texel),
     // which the module then requires.
+    // A `half` result left to the device's own 16-bit precision (`narrow::round_native`) is
+    // within the same note, and no measurement covers it.
+    let relaxed = !module.relaxed().is_empty();
     let converts = quantize == crate::spirv::builder::QuantizeForm::Converted
-        && crate::lower::arith::narrow::rounds_by_conversion(&module, m)?;
+        && (relaxed || crate::lower::arith::narrow::rounds_by_conversion(&module, m)?);
     let measured_conversion = converts
+        && !relaxed
         && p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfConversion)
         && !crate::lower::arith::narrow::rounds_unmeasured(&module, m)?;
     // A `half` read from its bits by the device's widening, or encoded to them by its narrowing

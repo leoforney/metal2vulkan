@@ -116,12 +116,69 @@ pub(crate) unsafe fn allocate_memory(
         return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
     };
     vk_made(VkMaking::Memory, Location::caller());
+    note_allocation_site(info.allocation_size);
     let busy = allocations::Busy::of(admitted.as_deref());
     // SAFETY: the caller's.
     let memory = unsafe { device.allocate_memory(info, None) };
     drop(busy);
     allocations::allocated(admitted, memory.is_ok());
     memory
+}
+
+/// The call stacks that allocated device memory of at least [`SITE_BYTES`], by the bytes they
+/// allocated: what a process's GPU memory went to, without a debugger on the device. A stack is
+/// its first [`SITE_FRAMES`] return addresses past this function's; at most [`SITE_COUNT`]
+/// stacks are kept, a new one past them counted under the last. Kept only with the diagnostics on
+/// (`stage_trace::diagnostics`).
+const SITE_BYTES: u64 = 4 << 20;
+const SITE_FRAMES: usize = 10;
+const SITE_COUNT: usize = 32;
+static SITES: std::sync::Mutex<Vec<AllocationSite>> = std::sync::Mutex::new(Vec::new());
+
+/// One call stack's allocations ([`allocation_sites`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocationSite {
+    /// Bytes allocated so far.
+    pub bytes: u64,
+    /// Allocations so far.
+    pub count: u64,
+    /// Return addresses, innermost first; 0 past the stack's end.
+    pub frames: [usize; SITE_FRAMES],
+}
+
+fn note_allocation_site(bytes: u64) {
+    if bytes < SITE_BYTES || !crate::stage_trace::diagnostics() {
+        return;
+    }
+    let mut raw = [std::ptr::null_mut::<libc::c_void>(); SITE_FRAMES + 2];
+    // SAFETY: `raw` holds the count passed.
+    #[cfg(target_vendor = "apple")]
+    let depth = unsafe { libc::backtrace(raw.as_mut_ptr(), raw.len() as libc::c_int) }.max(0) as usize;
+    #[cfg(not(target_vendor = "apple"))]
+    let depth = 0usize;
+    let mut frames = [0usize; SITE_FRAMES];
+    for (frame, address) in frames.iter_mut().zip(raw.iter().take(depth).skip(2)) {
+        // The pointer authentication bits of a return address (arm64e) are not part of it.
+        *frame = (*address as usize) & ((1usize << 47) - 1);
+    }
+    let Ok(mut sites) = SITES.lock() else { return };
+    let at = match sites.iter().position(|site| site.frames == frames) {
+        Some(at) => at,
+        None if sites.len() < SITE_COUNT => {
+            sites.push(AllocationSite { frames, ..Default::default() });
+            sites.len() - 1
+        }
+        None => sites.len() - 1,
+    };
+    sites[at].bytes += bytes;
+    sites[at].count += 1;
+}
+
+/// The call stacks that allocated device memory of 4 MiB or more, most bytes first.
+pub fn allocation_sites() -> Vec<AllocationSite> {
+    let mut sites = SITES.lock().map(|sites| sites.clone()).unwrap_or_default();
+    sites.sort_by_key(|site| std::cmp::Reverse(site.bytes));
+    sites
 }
 
 /// `image` bound to `memory` at `offset`.

@@ -83,9 +83,11 @@ use crate::gpu_time::Calibration;
 use crate::loader_word::DeviceWord;
 use crate::memory;
 use crate::release::{self, Generated, Released};
+use crate::shader_cache::PrimingCache;
 use crate::sharing::Sharing;
 use crate::tracker::Barrier;
 use ash::vk;
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 use super::functions::Vk;
@@ -362,7 +364,7 @@ fn specialization() -> vk::SpecializationInfo<'static> {
 /// What the device primed has: a queue family that writes timestamps, `hostQueryReset`, device
 /// addresses, `VK_EXT_device_generated_commands`, sparse binding on its queues, the push command,
 /// calibrated timestamps, and the render encoder's commands of [`PrimedDraws`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Has {
     pub(crate) timestamps: bool,
     pub(crate) host_query_reset: bool,
@@ -404,6 +406,16 @@ impl PrimedDraws {
     }
 }
 
+/// Identity includes every byte of the helper implementation, enabled compile
+/// profile (in Records), instance settings, driver identity, and these choices.
+/// No pointer/handle or host path enters the persistent key.
+pub(super) fn cache_key(has: Has, queue_family: u32) -> metal2vulkan::cache::Hash256 {
+    crate::shader_cache::driver::Making::new("entry-point-priming-v1")
+        .digest(&Sha256::digest(include_bytes!("prime.rs")).into())
+        .text(&(has, queue_family))
+        .finish()
+}
+
 /// Prime `device` of `physical`, made from `instance`, whose queues are `queues`, the first of
 /// its primary family `queue_family`, its buffers and images shared as `sharing` says, on this
 /// thread; `has` says what the device has, `generated` holds the commands of
@@ -431,6 +443,7 @@ pub(super) unsafe fn prime(
     calibration: Option<Calibration>,
     drawn: PrimedDraws,
     ycbcr: Option<vk::SamplerYcbcrConversionCreateInfo<'static>>,
+    mut disk: PrimingCache,
 ) -> Result<(), Error> {
     let mut primer = Primer {
         device,
@@ -443,6 +456,8 @@ pub(super) unsafe fn prime(
         memory: unsafe { instance.get_physical_device_memory_properties(physical) },
         calls: Calls::NONE,
         held: Vec::new(),
+        disk: &mut disk,
+        pipeline_cache: vk::PipelineCache::null(),
     };
     // SAFETY: the caller's.
     let primed = unsafe {
@@ -461,6 +476,10 @@ pub(super) unsafe fn prime(
     unsafe {
         let _ = device.device_wait_idle();
         primer.made(Call::DeviceWaitIdle);
+        if primed.is_ok() && primer.pipeline_cache != vk::PipelineCache::null() {
+            primer.disk.keep(device, loader_word, primer.pipeline_cache);
+            primer.made(Call::GetPipelineCacheData);
+        }
         while let Some(release) = primer.held.pop() {
             let call = release(device);
             primer.made(call);
@@ -548,6 +567,8 @@ struct Primer<'a> {
     calls: Calls,
     /// What was made, released last first.
     held: Vec<Release>,
+    disk: &'a mut PrimingCache,
+    pipeline_cache: vk::PipelineCache,
 }
 
 impl Primer<'_> {
@@ -872,7 +893,7 @@ impl Primer<'_> {
                 .layout(layout)
                 .push_next(&mut flags);
             let pipeline = device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_compute_pipelines(self.pipeline_cache, &[info], None)
                 .map_err(|(_, error)| vulkan(error))?[0];
             self.hold(pipeline);
             let pipelines = ExecutionSetPipelineInfo::new(pipeline, 1);
@@ -1208,9 +1229,8 @@ impl Primer<'_> {
             let module = device.create_shader_module(&info, None).map_err(vulkan)?;
             self.made(Call::CreateShaderModule);
             self.hold(module);
-            let cache = device
-                .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
-                .map_err(vulkan)?;
+            let cache = self.disk.open(device, self.loader_word).map_err(vulkan)?;
+            self.pipeline_cache = cache;
             self.made(Call::CreatePipelineCache);
             self.hold(cache);
             let specialization = specialization();

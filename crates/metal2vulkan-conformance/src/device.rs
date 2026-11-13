@@ -260,8 +260,9 @@ fn loader() -> Option<PathBuf> {
 /// **Neither changes a native answer.** The device's native arithmetic and value answers are the
 /// contract under both (AGENTS.md, rule 1): no switch emulates Metal's bits where the device has a
 /// native form, so the notes that state the device's own answer fire alike under either policy
-/// ([`crate::replay::NATIVE_NOTES`]). The one arithmetic switch, `half_chains`, acts only on a
-/// device without `shaderFloat16`, which has no native `half` to answer with.
+/// ([`crate::replay::NATIVE_NOTES`]). The one arithmetic switch, `half_chains`, acts on a device
+/// without `shaderFloat16`, which has no native `half` to answer with, and on one whose 16-bit
+/// floats keep no denormals, where it chooses between two statements of the device's own `half`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy {
     /// `DevicePolicy::exact_answers()`: the accurate form of each of the runtime's

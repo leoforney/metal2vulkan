@@ -37,6 +37,11 @@
 //!   shadow here instead (`texture/ycbcr_image.rs`, `shadow.rs`): every storage binding of it
 //!   writes the shadow's view and names the shadow in its uses, and every other binding names its
 //!   own image. It is exact and announces nothing.
+//! - **A YCbCr texture over its planes alone** (`texture/ycbcr_image.rs`) has no image of its
+//!   own: its image, made at its first slot binding that does not read its planes in place, is
+//!   held here with the copies that convert the planes into it, and every such binding writes
+//!   its view and names it in its uses. It is the image the texture would have been made with,
+//!   and announces nothing.
 
 use super::{Image, Owner, Storage, Texture};
 use crate::binding_view::binding_view;
@@ -170,6 +175,10 @@ impl Texture {
         storage: bool,
         attached: bool,
     ) -> Result<Option<Arc<UsageShadow>>, Error> {
+        // Over its planes alone: its image is made here, at the first binding that needs it.
+        if self.image_later().is_some() {
+            return Ok(Some(self.usage_shadow(call, Need::Usage)?));
+        }
         if self.needs_usage_shadow(storage) {
             let shadow = self.usage_shadow(call, Need::Usage)?;
             if !shadow.announced.swap(true, Ordering::Relaxed) {
@@ -251,6 +260,16 @@ impl Texture {
         }
         // A converted texture's image has both shader usages: the slot holds its write shadow.
         let shadow = match ycbcr_writes_stored(self.0.record.pixel_format) {
+            // But over its planes alone, where it holds the image itself and the conversion.
+            _ if self.image_later().is_some() => {
+                let (image, copies) = self.later_image(call)?;
+                UsageShadow {
+                    image,
+                    copies,
+                    truth: "its planes",
+                    announced: AtomicBool::new(true),
+                }
+            }
             true => {
                 let (image, copies) = self.ycbcr_write_shadow(call)?;
                 UsageShadow {

@@ -2111,6 +2111,9 @@ fn write_fields(upload: &Upload, table: u64, set: u64, count: u64) -> Result<(),
 }
 
 impl CommandBuffer {
+    /// Stable trace identity for this command buffer until its completion.
+    pub fn diagnostic_id(&self) -> u64 { Arc::as_ptr(&self.0) as u64 }
+
     /// A new command buffer of `root`, on its place `queue`, holding `slot` of it.
     pub(super) fn new(queue: &QueueGen, root: &CommandQueue, slot: Slot) -> CommandBuffer {
         let footprints = Footprints::default();
@@ -3073,9 +3076,12 @@ impl CommandBuffer {
         failure: Option<CommitFailure>,
         hand: Hand,
     ) -> Result<(), Error> {
+        let id = Arc::as_ptr(&self.0) as usize;
+        crate::stage_trace::mark(id, crate::stage_trace::Stage::CommitCall, 0);
         // Left to wait for the last render encoder's end, where its call left it to the device's
         // lowering thread and the thread has not lowered it, or for the commits left so.
         if failure.is_none() && self.queue_commit(call, hand)? {
+            crate::stage_trace::mark(id, crate::stage_trace::Stage::CommitQueued, 0);
             return Ok(());
         }
         // The last render encoder's end, where its call left it to the device's lowering thread.
@@ -3178,6 +3184,12 @@ impl CommandBuffer {
         run: CommitRun,
         hand: Hand,
     ) -> Result<(), Error> {
+        let run_kind = match run {
+            CommitRun::AtCall => 0,
+            CommitRun::Queued => 1,
+            CommitRun::Refused => 2,
+        };
+        crate::stage_trace::mark(Arc::as_ptr(&self.0) as usize, crate::stage_trace::Stage::CommitRun, run_kind);
         let _for = self.notices_for();
         // The waiting fetched render targets take their storage form at this commit where it
         // allows (`storage_form.rs`): one atomic read where none waits. The scheduler's thread
@@ -3432,6 +3444,11 @@ impl CommandBuffer {
                 return Err(error);
             }
         };
+        crate::stage_trace::mark(
+            Arc::as_ptr(&self.0) as usize,
+            crate::stage_trace::Stage::Prepared,
+            prepared.len() as u32,
+        );
         // The first segment a host step records, which the device announces (a loop's check
         // and a staged scatter's CPU copy record nothing).
         let announced = segments
@@ -5231,6 +5248,7 @@ impl CommandBufferShared {
         result: Result<(), CommandBufferError>,
     ) {
         let (contexts, queue) = (buffer.device.shared().contexts.clone(), buffer.queue.id());
+        let id = Arc::as_ptr(&*buffer) as usize;
         let (signallers, own): (Vec<Arc<Follow>>, _) = {
             let state = lock(&buffer.state);
             let signallers = (state.waited.iter())
@@ -5279,12 +5297,16 @@ impl CommandBufferShared {
                 let ran = contexts.run_here(queue, item, may_run);
                 drop(unheld);
                 match ran {
-                    Ok(()) => return,
+                    Ok(()) => {
+                        crate::stage_trace::mark(id, crate::stage_trace::Stage::Finished, 1);
+                        return;
+                    }
                     Err(item) => item,
                 }
             }
             None => item,
         };
+        crate::stage_trace::mark(id, crate::stage_trace::Stage::Finished, 2);
         contexts.post(queue, item.whole());
         posted();
     }
@@ -5305,6 +5327,8 @@ impl CommandBufferShared {
     /// The first part of [`complete`](Self::complete), to its completion-seen handlers: its
     /// status final, they ran. What the rest needs is answered.
     fn complete_seen(self: &Arc<Self>, result: Result<(), CommandBufferError>) -> Rest {
+        let trace = Arc::as_ptr(self) as usize;
+        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteBegin, 0);
         // A thread sleeps on `changed`, as the state's lock below reads.
         let parked;
         // Its command pool, where it settled, whose primary the device's spares begin ahead once
@@ -5497,6 +5521,7 @@ impl CommandBufferShared {
         }
         // The holds taken above go here, with no lock of the command buffer's held, before any
         // handler of its runs: a detach from one of them detaches (`detach.rs`).
+        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteState, 0);
         drop(submitted_holds);
         self.wake_parked(parked);
         let buffer = CommandBuffer(Arc::clone(self));
@@ -5527,6 +5552,7 @@ impl CommandBufferShared {
     /// handlers ran ([`complete_seen`](Self::complete_seen)): its completed handlers, its queue's
     /// slot, its releases and its gate.
     fn complete_rest(self: &Arc<Self>, rest: Rest) {
+        let trace = Arc::as_ptr(self) as usize;
         let Rest {
             settled_pool,
             released_versions,
@@ -5553,6 +5579,7 @@ impl CommandBufferShared {
                 exit_guard::program(|| handler(&buffer));
             }
         }
+        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteHandlers, 0);
         let handled = Instant::now();
         drop(buffer);
         // Its queue's slot comes back as its last completed handler returns, as Metal's does: a
@@ -5633,6 +5660,7 @@ impl CommandBufferShared {
         }
         // The gate notifies its waiters only where it opened here, which this transition's own
         // hold holds it from: the notify for them is that hold's, as it goes (`gate.rs`).
+        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteRetained, 0);
         let notified = self.gate.finish();
         self.device.shared().counts.command_buffer_wake(notified);
         // Its pool's primary begun ahead, where no command buffer took the pool since
@@ -5643,6 +5671,7 @@ impl CommandBufferShared {
             let shared = self.device.shared();
             shared.spares.begin_ahead(shared, pool);
         }
+        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteEnd, 0);
     }
 }
 

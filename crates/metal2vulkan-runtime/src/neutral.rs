@@ -37,7 +37,7 @@ use metal2vulkan::bind::NeutralResource;
 use metal2vulkan::device::FormatUsage;
 use metal2vulkan::vk::Format;
 use std::any::Any;
-use std::collections::HashMap;
+use super::key_hash::KeyMap;
 use std::sync::{Arc, Mutex, Weak};
 
 /// One neutral image, its view and its memory.
@@ -99,9 +99,9 @@ impl Filled for NeutralZeros {
 /// A device's neutral images, texel buffers, zero buffers and samplers, made at first use.
 #[derive(Default)]
 pub(super) struct Neutrals {
-    images: HashMap<NeutralResource, Arc<NeutralImage>>,
+    images: KeyMap<NeutralResource, Arc<NeutralImage>>,
     /// By format and whether the view is a storage texel buffer's.
-    texels: HashMap<(Format, bool), Arc<NeutralTexels>>,
+    texels: KeyMap<(Format, bool), Arc<NeutralTexels>>,
     /// By their length in bytes, which the plan asks for (`zero_buffer_bytes`, fixed for the
     /// device): the read-only zero buffers, and how many the device has made.
     ///
@@ -113,12 +113,12 @@ pub(super) struct Neutrals {
     /// allocate-and-zero a draw. Zeros of a length the device's own limits fix cannot have
     /// changed since the device was made, so the device makes each length once and keeps it, as
     /// it keeps its neutral images, texel buffers and samplers.
-    zeros: HashMap<u64, Arc<NeutralZeros>>,
+    zeros: KeyMap<u64, Arc<NeutralZeros>>,
     /// How many zero buffers the device has made, for the check that draws share one
     /// (`tests::neutral_zeros_shared`).
     zeros_made: u64,
     /// By whether depth comparison is enabled.
-    samplers: HashMap<bool, vk::Sampler>,
+    samplers: KeyMap<bool, vk::Sampler>,
 }
 
 impl Neutrals {

@@ -123,8 +123,14 @@ compile does. `DevicePolicy::default()` is `DevicePolicy::UNTRUSTED`:
   operation whose flags hold `contract` and `reassoc` and whose result only such operations read
   is left unrounded: the chain rounds where a value leaves it, one quantize per exit instead of
   one per operation, recorded `FastMathRewrites`. `half_chains = HalfChainPolicy::EachOperation`,
-  which `exact_answers()` selects, rounds every operation. A device with `shaderFloat16` computes
-  `half` alike under either value.
+  which `exact_answers()` selects, rounds every operation. On a device with `shaderFloat16`
+  whose 16-bit floats keep no denormals (no `DenormPreserve` for 16 bits; Turnip on Adreno 6xx
+  and 7xx), the same switch chooses how a `half` operation the device has an instruction for
+  (`+ - * /`, `fma`, `dot`, `mix`, `sqrt`, `rsqrt`, `exp`, `exp2`, `log`, `log2`) is stated: under
+  `AtExits` its `float` result is decorated `RelaxedPrecision` and the device computes it at its
+  own 16-bit precision (`narrow::round_native`), recorded `NativeHalfConversion`; under
+  `EachOperation` it is computed in `float` and converted to 16 bits and back, as before. Every
+  other device with `shaderFloat16` computes `half` alike under either value.
 - **Batches of a queue ordered by their ends** (`BatchOrderPolicy::Ends`, the runtime's choice; no
   pipeline differs). On ANV, RADV and NVIDIA's driver, each measured to start no kernel submission
   of a `VkQueue` before the one before it completed, each batch of command buffers ends with a

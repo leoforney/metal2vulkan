@@ -529,6 +529,9 @@ impl SchedulerShared {
     /// lock of its sleep; one that sleeps later reads what the waker wrote first), counted as
     /// `woken`; else the notify, a system call, is spared.
     fn woken(&self, woken: Woken, asleep: Asleep) {
+        if !matches!(asleep, Asleep::No) {
+            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerWake, woken as u32);
+        }
         match asleep {
             // The thread alone waits on it.
             Asleep::OnCondvar => {
@@ -708,6 +711,8 @@ struct Held {
     /// The host nanoseconds at the first look of the scheduler's that found it held
     /// ([`held_for`](Self::held_for)), until it goes ([`hold_ended`](Self::hold_ended)).
     held_since: Option<u64>,
+    /// The reasons a look held it for that the stage trace recorded (`stage_trace.rs`), a bit each.
+    traced_reasons: u8,
 }
 
 impl Held {
@@ -716,6 +721,15 @@ impl Held {
     /// read from the host's clock while nothing waits.
     fn held_for(&mut self, reason: HeldFor) {
         (self.buffer.device().shared().counts).head_held_for(reason);
+        let bit = 1u8 << (reason as u8);
+        if self.traced_reasons & bit == 0 {
+            self.traced_reasons |= bit;
+            crate::stage_trace::mark(
+                Arc::as_ptr(&*self.buffer) as usize,
+                crate::stage_trace::Stage::Held,
+                (reason as u32 + 1) | ((self.index.min(255) as u32) << 8),
+            );
+        }
         if self.held_since.is_none() {
             self.held_since = Some(gpu_time::host_nanos());
         }
@@ -859,6 +873,11 @@ impl Scheduler {
         hand: Hand,
     ) {
         let shared = &*self.shared;
+        crate::stage_trace::mark(
+            Arc::as_ptr(buffer) as usize,
+            crate::stage_trace::Stage::Handed,
+            batches.len() as u32,
+        );
         let committed = Committed {
             buffer: buffer.hold(),
             queue,
@@ -1245,6 +1264,7 @@ fn run(shared: &Arc<SchedulerShared>) {
                 && bound.is_none()
                 && stalls.is_none();
             let slice = bound.map_or(slice, |left| left.min(slice));
+            let slice_ms = slice.as_millis().min(0x7fff) as u32;
             let on_gpu = shared.nudge.get().filter(|_| shared.gpu_waits(&mut gpu));
             // The lock of the sleep ([`Sleep`]), under the scheduler's: a waker that found no
             // pass under way wrote what it asks for before it took it, so its commit or nudge is
@@ -1255,12 +1275,15 @@ fn run(shared: &Arc<SchedulerShared>) {
             }
             shared.sleeps.fetch_add(1, Ordering::Relaxed);
             if let Some(nudge) = on_gpu {
+                crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerSleep, slice_ms | 0x8000);
                 state = wait_for_gpu(shared, (state, sleep), nudge, &mut gpu, (slice, short));
+                crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, 0);
                 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
                 trace::submitting("thread woke");
                 continue;
             }
             sleep.asleep = true;
+            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerSleep, slice_ms);
             // A waker that marks the state under the scheduler's lock takes it once this lets
             // go of it, and then the sleep's, which the wait lets go of.
             drop(state);
@@ -1277,6 +1300,7 @@ fn run(shared: &Arc<SchedulerShared>) {
                     waited.timed_out()
                 }
             };
+            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, u32::from(timed_out));
             sleep.asleep = false;
             drop(sleep);
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -1400,8 +1424,12 @@ fn run_work(shared: &Arc<SchedulerShared>, kind: Kind, work: Work) -> bool {
 fn round(shared: &SchedulerShared, left: &mut Left<Work>, passed: &mut Passed) -> bool {
     (shared.inbox).pass(|state, commits| {
         shared.passes.fetch_add(1, Ordering::Relaxed);
+        crate::stage_trace::mark(0, crate::stage_trace::Stage::PassBegin, 0);
+        let before = passed.spent.len();
         let taken = pass(state, commits, (&mut *passed, &mut *left), &shared.awaits);
         shared.took_in(taken);
+        let spent = passed.spent.len().saturating_sub(before);
+        crate::stage_trace::mark(0, crate::stage_trace::Stage::PassEnd, spent.min(0xffff) as u32);
         !passed.exiting && left.is_empty() && !passed.more
     });
     passed.more = false;
@@ -1460,6 +1488,11 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
     } in commits.drain(..)
     {
         let count = batches.len();
+        crate::stage_trace::mark(
+            Arc::as_ptr(&*buffer) as usize,
+            crate::stage_trace::Stage::Taken,
+            count as u32,
+        );
         let State { order, binary, .. } = &mut *state;
         let held = batches.into_iter().enumerate().map(|(index, batch)| Held {
             buffer: buffer.hold(),
@@ -1475,6 +1508,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
             hastened: false,
             counted_held: false,
             held_since: None,
+            traced_reasons: 0,
         });
         order.push(queue, held);
         spent.push(buffer);

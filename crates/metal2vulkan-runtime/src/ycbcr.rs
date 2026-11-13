@@ -309,6 +309,11 @@ pub struct IoSurfaceYCbCr {
     pub chroma_bytes_per_row: u64,
     /// The surface's `kIOSurfaceYCbCrMatrix` as the texture is made, `None` without one.
     pub matrix: Option<SurfaceYCbCrMatrix>,
+    /// Whether a texture whose planes a function reads in place, of `ShaderRead` usage alone, is
+    /// made over its planes alone (`texture/ycbcr_image.rs`): with no image until a slot binding
+    /// needs one, and for slot bindings only. `false` unless the caller asks
+    /// ([`with_planes_alone`](Self::with_planes_alone)).
+    pub planes_alone: bool,
 }
 
 impl IoSurfaceYCbCr {
@@ -328,7 +333,16 @@ impl IoSurfaceYCbCr {
             chroma_offset,
             chroma_bytes_per_row,
             matrix: None,
+            planes_alone: false,
         }
+    }
+
+    /// These facts for a caller that binds the texture at slots only while it is over its planes
+    /// alone ([`Texture::is_planes_alone`](crate::Texture::is_planes_alone)) and makes the
+    /// texture without this for any other call.
+    pub const fn with_planes_alone(mut self) -> IoSurfaceYCbCr {
+        self.planes_alone = true;
+        self
     }
 
     /// These facts with the surface's `kIOSurfaceYCbCrMatrix`.
@@ -858,6 +872,12 @@ impl YCbCrConversion {
         // Held under `making`: no other thread set it.
         let _ = self.made.set(made);
         Ok(())
+    }
+
+    /// The bytes of its staging buffer, which it holds for the texture's life once it was made
+    /// ([`YCbCrConversion::make`]): 0 before.
+    pub(super) fn staging_bytes(&self) -> u64 {
+        self.made.get().map_or(0, |made| made.staging.length())
     }
 
     /// The planes it converts, and the bytes of their buffer they lie in.

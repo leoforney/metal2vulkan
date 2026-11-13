@@ -1099,10 +1099,19 @@ impl Buffer {
             let texels = Texels::placed(self.clone(), placed, texel_bytes, descriptor)
                 .with_options(options)
                 .over_surface(surface);
+            // Over its planes alone where the caller asks and the texture can be
+            // (`texture/ycbcr_image.rs`).
+            let alone = ycbcr_surface.is_some_and(|facts| facts.planes_alone);
             return self
-                .device()
-                .new_converted_texture(call, texels, descriptor, &layout, id_use, (&planes, span))
-                .map(Over::Made);
+                .device().new_converted_texture(
+                call,
+                texels,
+                descriptor,
+                &layout,
+                (id_use, alone),
+                (&planes, span),
+            )
+            .map(Over::Made);
         }
         if layout.texture_type == TextureType::TextureBuffer {
             // Over a surface's plane, of the descriptor's options (`Buffer::new_texture_with_iosurface_plane`):

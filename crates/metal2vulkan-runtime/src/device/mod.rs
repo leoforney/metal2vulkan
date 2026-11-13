@@ -31,6 +31,10 @@ pub(super) mod prime;
 pub(super) mod properties;
 pub(crate) mod queue_quiet;
 pub(crate) mod relay;
+mod room;
+
+/// The place in the source that first recorded a lost device ([`Device::lost_at`]).
+static LOST_AT: std::sync::OnceLock<(&'static str, u32)> = std::sync::OnceLock::new();
 mod staging;
 pub(super) mod submit;
 pub(crate) mod submit_stalls;
@@ -667,6 +671,9 @@ pub(super) struct DeviceShared {
     /// The thread that lets go of what a released state's pool pieces gave back as they ended
     /// (`pipeline/reaper.rs`).
     pub(super) reaper: Arc<crate::pipeline::reaper::Reaper>,
+    /// The thread that keeps room in the pools the encodings and commits place their own
+    /// resources in, asked by the creation calls (`device/room.rs`).
+    room: room::Room,
     /// The trails its threads open between a signal and their last let-go of what they held for
     /// the work, which a command buffer's waiters wait for (`trails.rs`).
     pub(crate) trails: Arc<crate::trails::Trails>,
@@ -1030,6 +1037,9 @@ impl Drop for DeviceShared {
         // What the reaper is handed holds the device: none is left, and it only stops, unless
         // this teardown runs on its thread.
         self.reaper.stop();
+        // The room keeper holds the device only for a pass: it stops, unless this teardown runs
+        // on its thread.
+        self.room.stop();
         // What the residency thread releases holds the device: none is left.
         #[cfg(unix)]
         self.residency.stop();
@@ -1485,11 +1495,59 @@ impl Device {
     /// state's, a buffer's, a texture's, a heap's), so that no encoding or commit makes a memory
     /// block, whose `vkAllocateMemory` waited 2.37 s for other processes' GPU work on NVIDIA's
     /// driver. Nothing in a host step, a serial point of the command buffers' stream that makes
-    /// only what it needs.
+    /// only what it needs. The device's room keeper makes the blocks, so the call
+    /// returns at once (`device/room.rs`).
     pub(crate) fn keep_room(&self) {
         if crate::exit_guard::in_host_step() {
             return;
         }
+        self.shared().room.ask(self);
+    }
+
+    /// Give back the memory kept for later placements: every spare dedicated block and every
+    /// kept empty pooled block (`memory::SPARE_FOR`), as Metal's resource cache gives memory
+    /// back when the system reports memory pressure. How many blocks went. No Metal counterpart.
+    ///
+    /// The parked images and buffers go first (`recycle.rs`): each keeps its placement, so the
+    /// blocks they lie in empty only once they went.
+    pub fn release_kept_memory(&self) -> usize {
+        let Some(_busy) = crate::exit_guard::enter() else {
+            return 0;
+        };
+        self.age_parked_images(true);
+        self.age_parked_buffers(true);
+        let shared = self.shared();
+        lock(&shared.memory).release_all_kept(shared.vk())
+    }
+
+    /// Let the parked images and buffers go whose time is up (`recycle.rs`), from the room
+    /// thread: a device that makes and releases nothing more still lets them go.
+    pub(crate) fn age_parked(&self) {
+        self.age_parked_images(false);
+        self.age_parked_buffers(false);
+    }
+
+    /// How long a spare block of the device's memory stays before it is freed
+    /// (`memory::SPARE_FOR`): the age a consumer that gives memory back by age of its own
+    /// (resources its caller declared discardable) takes, so both go on one clock. No Metal
+    /// counterpart.
+    pub fn spare_age() -> std::time::Duration {
+        crate::memory::KEPT_EMPTY_FOR
+    }
+
+    /// The device's live blocks of its own memory by what holds them and by size, and what its
+    /// driver committed of the lazily allocated ones (`memory::MemoryKinds`): one walk of the
+    /// blocks under the memory's lock. A call of the program's on its own thread, as
+    /// [`work_counts`](Self::work_counts) is: it takes no section of the exit guard. No Metal
+    /// counterpart.
+    pub fn memory_kinds(&self) -> crate::MemoryKinds {
+        let shared = self.shared();
+        lock(&shared.memory).kinds(shared.vk())
+    }
+
+    /// One pass of the room keeper (`device/room.rs`): room kept in the pools and their blocks
+    /// made ahead while they grow (`memory::keep_room`, `memory/ready.rs`).
+    pub(crate) fn keep_room_now(&self) {
         let shared = self.shared();
         let copies = || self.copies_color_on_the_host();
         let memory = &shared.memory;
@@ -1534,6 +1592,13 @@ impl Device {
         Arc::ptr_eq(self.line(), other.line())
     }
 
+    /// Where the runtime first recorded a lost device in this process, as its source file and
+    /// line: which of its checks or which failed Vulkan call lost it, for a consumer's log. No
+    /// Metal counterpart.
+    pub fn lost_at() -> Option<(&'static str, u32)> {
+        LOST_AT.get().copied()
+    }
+
     /// Whether the device was lost: not to a public call that took its arguments on it before
     /// its loss, which the loss follows (`Device::at_serving_taking`, `line.rs`).
     pub(super) fn is_lost(&self) -> bool {
@@ -1542,8 +1607,12 @@ impl Device {
     }
 
     /// Record that the device was lost: its line recovers at the next call that needs the device,
-    /// where it recovers (`line.rs`).
+    /// where it recovers (`line.rs`). The first loss's place in the source is kept for
+    /// [`Device::lost_at`].
+    #[track_caller]
     pub(super) fn mark_lost(&self) {
+        let at = std::panic::Location::caller();
+        LOST_AT.get_or_init(|| (at.file(), at.line()));
         let shared = self.shared();
         shared.lost.store(true, Ordering::Release);
         shared.line.lose(shared);
@@ -2167,6 +2236,31 @@ impl Device {
         // SAFETY: the device is live, of `physical`, and enables timeline semaphores, and
         // `bufferDeviceAddress` where `device_address` says so; `queues` holds at least one of
         // its queues, which nothing uses yet.
+        let priming_has = drawn.has(prime::Has {
+            timestamps: timestamp_bits > 0,
+            // A device the runtime created enables it (`enables.rs`).
+            host_query_reset: owned,
+            device_addresses: device_address,
+            generated_commands: generated_commands.is_some(),
+            sparse_binding: sparse.binds(),
+            push_descriptor: push_descriptor.is_some(),
+            calibration: calibrated.is_some(),
+            object_names: object_name.is_some(),
+            extended_dynamic_state: false,
+            primitive_restart: false,
+            color_write_masks: false,
+            sized_index_bind: false,
+            ycbcr_conversion: ycbcr_formats.primer().is_some(),
+        });
+        // Raw disk/cache I/O only: starting the ordinary guarded cache or its
+        // worker before priming would change the destructor ordering it protects.
+        let priming_cache = cache.priming(
+            &unsafe { instance.raw.get_physical_device_properties(physical) },
+            compile.profile_fingerprint(),
+            instance.settings,
+            prime::cache_key(priming_has, queue_family),
+            instance.sink().cloned(),
+        );
         if let Err(error) = unsafe {
             prime::prime(
                 &instance.raw,
@@ -2183,27 +2277,13 @@ impl Device {
                 queue_family,
                 &queues,
                 Sharing::with_buffers(&queue_families, &buffer_families),
-                drawn.has(prime::Has {
-                    timestamps: timestamp_bits > 0,
-                    // A device the runtime created enables it (`enables.rs`).
-                    host_query_reset: owned,
-                    device_addresses: device_address,
-                    generated_commands: generated_commands.is_some(),
-                    sparse_binding: sparse.binds(),
-                    push_descriptor: push_descriptor.is_some(),
-                    calibration: calibrated.is_some(),
-                    object_names: object_name.is_some(),
-                    extended_dynamic_state: false,
-                    primitive_restart: false,
-                    color_write_masks: false,
-                    sized_index_bind: false,
-                    ycbcr_conversion: ycbcr_formats.primer().is_some(),
-                }),
+                priming_has,
                 generated_commands.as_ref(),
                 push_descriptor,
                 calibrated,
                 drawn,
                 ycbcr_formats.primer(),
+                priming_cache,
             )
         } {
             scheduler.stop();
@@ -2771,6 +2851,7 @@ impl Device {
             uncommitted: Arc::default(),
             pipeline_pool: Default::default(),
             reaper: Default::default(),
+            room: Default::default(),
             trails: Arc::default(),
             recoveries: Arc::default(),
             libraries: graphics_pipeline_library.then(Default::default),

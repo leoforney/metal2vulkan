@@ -1438,6 +1438,9 @@ pub struct TypedModule {
     /// to answer Metal's where the driver takes `DriverDeviation::MetalHalfConversion`
     /// (`ModuleBuilder::measured_roundings`), recorded as the builder emits them.
     pub(in crate::spirv) measured_roundings: std::collections::BTreeSet<Value>,
+    /// The results of `half` operations left to the device's own 16-bit precision
+    /// (`ModuleBuilder::note_relaxed`), decorated `RelaxedPrecision`.
+    pub(in crate::spirv) relaxed: std::collections::BTreeSet<Value>,
     /// The texels the texture family's writes store, whose stored NaN the write's own notes
     /// account for (`ModuleBuilder::stored_texels`), recorded as the builder emits them.
     pub(in crate::spirv) stored_texels: std::collections::BTreeSet<Value>,
@@ -1470,6 +1473,12 @@ impl TypedModule {
     /// answer Metal's (`ModuleBuilder::note_measured_rounding`).
     pub fn measured_roundings(&self) -> &std::collections::BTreeSet<Value> {
         &self.measured_roundings
+    }
+
+    /// The results of `half` operations left to the device's own 16-bit precision, decorated
+    /// `RelaxedPrecision` (`ModuleBuilder::note_relaxed`).
+    pub fn relaxed(&self) -> &std::collections::BTreeSet<Value> {
+        &self.relaxed
     }
 
     /// The texels the texture family's writes store (`ModuleBuilder::note_stored_texel`).

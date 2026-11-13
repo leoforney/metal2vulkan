@@ -171,7 +171,7 @@ pub fn emit(fb: &mut FunctionBuilder<'_>, fma: Fma, args: &[Value]) -> BResult<V
         (Route::Native, Some(FloatFmt::F32)) => fb.glsl(GlslOp::Fma, &[a, b, c]),
         (Route::Native, Some(FloatFmt::Half)) => {
             let r = fb.glsl(GlslOp::Fma, &[a, b, c])?;
-            narrow::round(fb, fma.form, r)
+            narrow::round_native(fb, fma.form, r)
         }
         _ => Err(BuildError::Type(TypeRule::FunctionSignature)),
     }

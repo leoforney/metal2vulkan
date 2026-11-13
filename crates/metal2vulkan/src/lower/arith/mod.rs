@@ -702,6 +702,10 @@ pub struct ArithPlan {
     /// Whether [`ArithPlan::quantize`] is the device's own rounding (native half rounding,
     /// [`narrow::native_rounding`]), decided with it by [`finish`].
     pub native_half: bool,
+    /// Whether the result of a `half` operation the device has an instruction for is left to
+    /// the device's own 16-bit precision ([`narrow::relaxes`], [`narrow::round_native`]), decided
+    /// by [`finish`].
+    pub relaxed_half: bool,
     /// Whether a `half`'s NaN bits are left to the device's conversion where the module rounds
     /// through the conversion under the float controls ([`QuantizeForm::Controlled`]): a `half`
     /// texel takes the rounding's NaN (`narrow::round_texel`). Decided by [`finish`], on every
@@ -785,6 +789,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     cx.families.arith.wide = legal::holds_wide(cx.profile);
     cx.families.arith.quantize = narrow::quantize_form(cx.profile);
     cx.families.arith.native_half = narrow::native_rounding(cx.families.arith.quantize).is_some();
+    cx.families.arith.relaxed_half = narrow::relaxes(cx.profile);
     // Under the float controls a `half`'s NaN is the device's conversion's.
     cx.families.arith.native_half_nans = cx.families.arith.quantize == QuantizeForm::Controlled;
     // An extended-range, padded or bfloat texel's conversion is the device's arithmetic.

@@ -29,6 +29,7 @@
 #![recursion_limit = "256"]
 
 mod address;
+pub mod stage_trace;
 mod address_map;
 mod address_pool;
 mod allocations;
@@ -370,12 +371,18 @@ pub use render_values::{
 pub use resource::{ObjectId, ResourceRef};
 pub use resource_ids::{IdPlacement, ResourceId, ResourceIdKind};
 pub use sampler::{sampler_border_color, SamplerState, SamplerStateOptions};
+pub use creation::{allocation_sites, AllocationSite};
+pub use memory::{MemoryKinds, MEMORY_KIND_CLASSES};
+pub use shader_cache::system::{
+    set_cache_readable_by_all, set_system_layer, system_layer, SystemLayer, SystemLayerCounts,
+};
 pub use shader_cache::{
     ShaderCacheOptions, ShaderCacheStatistics, DEFAULT_CAPACITY, DEFAULT_MEMORY_CAPACITY,
 };
 pub use sparse::device::SparseFeatures;
 pub use sparse::encoder::ResourceStateCommandEncoder;
 pub use sparse::{SparsePageSize, SparseProblem, SparseTextureRegionAlignmentMode};
+pub use texture::{ycbcr_surface_counts, YCbCrSurfaceCounts};
 pub use texture::{SharedTextureHandle, Texture, VkImageLayouts, WrappedImageProblem};
 pub use texture_descriptor::{TextureDescriptor, TextureProblem, TextureSwizzleChannels};
 pub use texture_placement::{

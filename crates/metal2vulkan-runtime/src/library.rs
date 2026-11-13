@@ -555,6 +555,15 @@ impl Function {
         descriptor
     }
 
+    /// The function as `newFunctionWithDescriptor:` makes it with `name` as its specialized name,
+    /// for a frontend that makes the function first: `None` keeps its own name. Its definition and
+    /// constants stay its own.
+    pub fn with_specialized_name(mut self, name: Option<String>) -> Function {
+        self.specialized_name = name;
+        self.by_descriptor = true;
+        self
+    }
+
     /// The function as a stage links it, with its constant values, under its specialized name
     /// where it was made with one, specialized where it was made with constant values or by
     /// [`Library::new_function_with_descriptor`], and precompiled where it was made compiled to a

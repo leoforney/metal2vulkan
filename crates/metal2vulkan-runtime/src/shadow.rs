@@ -394,6 +394,8 @@ pub(super) enum ShadowSource {
         conversion: Box<YCbCrConversion>,
         /// The texture's format, which a refusal names.
         pixel_format: PixelFormat,
+        /// The image counted alive while these copies live (`texture/ycbcr_image.rs`).
+        _alive: crate::texture::ImageAlive,
     },
     /// A surface's two planes in a buffer's bytes, into which the texels a function writes to a
     /// 4:4:4 two-plane YCbCr texture are stored (`ycbcr.rs`): the shadow is an image of the

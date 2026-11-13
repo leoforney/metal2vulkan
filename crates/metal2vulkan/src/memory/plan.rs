@@ -33,7 +33,8 @@
 //!   lowered representation, an open one a buffer pointer as its 8-byte guest address.
 //! - **Constant globals**: a closed, type-consistent constant is a `Private` variable with its
 //!   initializer, unless its type would take the function's typed objects past
-//!   `alloca::MAX_UNSHARED`; any other one is placed in the **constant blob**, the byte image the
+//!   `alloca::MAX_UNSHARED` or dynamic indexing reaches a table larger than 4 KiB. Other globals
+//!   are placed in the **constant blob**, the byte image the
 //!   artifact carries (`WriteSource::ConstantBlob`).
 //! - **Needs**: dynamic roots, the handle classes that need the handle table, and whether a guest
 //!   base is needed.
@@ -1059,28 +1060,39 @@ impl Planner<'_> {
                 let closed = !u.merged && !u.escapes && !u.stored && !u.cross_compare && !u.write;
                 // A type no typed object holds stays `Private`: selection refuses it, as before,
                 // which only sends a typed object past the room to the blob.
-                let form =
-                    if closed && u.typed && self.fit(global.value_ty, room, m)? != Fit::OverRoom {
-                        ConstGlobalForm::Private
-                    } else {
-                        let align = self.global_align(g, global.value_ty)?;
-                        let size = self
-                            .layouts
-                            .alloc_size(global.value_ty)
-                            .ok_or_else(not_lowered)?;
-                        let offset = round_up(*len as u64, align).ok_or_else(not_lowered)?;
-                        let end = offset.checked_add(size).ok_or_else(not_lowered)?;
-                        let end = usize::try_from(end).map_err(|_| not_lowered())?;
-                        // The initializer's refusals; its bytes and its writing's work are charged
-                        // once every initializer is checked.
-                        let nodes = self.blob_nodes(init, global.value_ty, m)?;
-                        let at = usize::try_from(offset).map_err(|_| not_lowered())?;
-                        grow(placed, 1, m)?;
-                        placed.push((init, global.value_ty, at));
-                        provenance::push_working(&mut costs, (end, nodes), &mut working, m)?;
-                        *len = end;
-                        ConstGlobalForm::Blob { offset }
-                    };
+                // Dynamically indexed tables above 4 KiB are shared read-only data.
+                // Private storage would replicate the table in every shader invocation.
+                let large_indexed = u.indexed
+                    && self
+                        .layouts
+                        .alloc_size(global.value_ty)
+                        .ok_or_else(not_lowered)?
+                        > 4096;
+                let form = if closed
+                    && u.typed
+                    && !large_indexed
+                    && self.fit(global.value_ty, room, m)? != Fit::OverRoom
+                {
+                    ConstGlobalForm::Private
+                } else {
+                    let align = self.global_align(g, global.value_ty)?;
+                    let size = self
+                        .layouts
+                        .alloc_size(global.value_ty)
+                        .ok_or_else(not_lowered)?;
+                    let offset = round_up(*len as u64, align).ok_or_else(not_lowered)?;
+                    let end = offset.checked_add(size).ok_or_else(not_lowered)?;
+                    let end = usize::try_from(end).map_err(|_| not_lowered())?;
+                    // The initializer's refusals; its bytes and its writing's work are charged
+                    // once every initializer is checked.
+                    let nodes = self.blob_nodes(init, global.value_ty, m)?;
+                    let at = usize::try_from(offset).map_err(|_| not_lowered())?;
+                    grow(placed, 1, m)?;
+                    placed.push((init, global.value_ty, at));
+                    provenance::push_working(&mut costs, (end, nodes), &mut working, m)?;
+                    *len = end;
+                    ConstGlobalForm::Blob { offset }
+                };
                 grow(out, 1, m)?;
                 out.push(ConstGlobalPlan { global: g, form });
             }

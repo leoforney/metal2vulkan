@@ -138,7 +138,10 @@ fn record(shared: &SchedulerShared, work: Work) -> bool {
     };
     let (buffer, index) = &work;
     let started = Instant::now();
+    let id = Arc::as_ptr(&**buffer) as usize;
+    crate::stage_trace::mark(id, crate::stage_trace::Stage::StepBegin, *index as u32);
     buffer.host_step(*index);
+    crate::stage_trace::mark(id, crate::stage_trace::Stage::StepEnd, *index as u32);
     for &call in exit_guard::HOST_STEP {
         exit_guard::called(call);
     }

@@ -87,7 +87,7 @@ fn choices() -> Vec<Choice> {
         choice!(p.completion: CompletionPolicy { Grouped, Exact }),
         choice!(p.batch_order: BatchOrderPolicy { Ends, Exact }),
         choice!(p.render_lowering: RenderLoweringPolicy { AtCall, Worker }),
-        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow }),
+        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow, InPlaceWrites }),
         choice!(p.half_chains: HalfChainPolicy { AtExits, EachOperation }),
         choice!(p.ycbcr_in_place_reads: YCbCrInPlacePolicy { Model, Exact }),
         choice!(p.pipeline_waits: PipelineWaitPolicy { Bounded, Exact }),

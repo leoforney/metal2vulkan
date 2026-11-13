@@ -1684,6 +1684,7 @@ impl Ser<'_> {
         // A copy shares its operand's id, so one id may carry several values: each decoration is
         // written once per id.
         let mut non_uniform = std::collections::BTreeSet::new();
+        let mut relaxed = std::collections::BTreeSet::new();
         for f in &m.functions {
             for p in &f.params {
                 if self.is_psb_pointer(self.value_ty(*p)?)? {
@@ -1725,6 +1726,11 @@ impl Ser<'_> {
                     // (VUID-RuntimeSpirv-NonUniform-06274).
                     if m.non_uniform.contains(&r) && non_uniform.insert(self.val(r)?) {
                         self.decorate(w, self.val(r)?, Decoration::NonUniform, &[])?;
+                    }
+                    // The result of a `half` operation at the device's own 16-bit precision
+                    // (`narrow::round_native`).
+                    if m.relaxed.contains(&r) && relaxed.insert(self.val(r)?) {
+                        self.decorate(w, self.val(r)?, Decoration::RelaxedPrecision, &[])?;
                     }
                 }
             }

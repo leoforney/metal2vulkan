@@ -233,6 +233,57 @@ const DEDICATED_SLACK: u64 = 4;
 /// makes and frees blocks.
 const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
 
+/// The first pooled block of a pool: later ones grow with the pool ([`Memory::next_block_bytes`]),
+/// doubling it up to [`BLOCK_BYTES`]. Where device memory is the system's own and every block is
+/// wired as it is made (a guest whose GPU imports its pages), a process with a few small resources
+/// otherwise held a 64 MiB block in each of its pools: 256-640 MiB each, 2 GiB in all at an iPadOS
+/// guest's home screen.
+pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
+
+/// Memory operations below this size are not traced.
+const TRACE_MIN_BYTES: u64 = 256 << 10;
+
+fn trace_memory(pool: (Holds, u32), bytes: u64, available: u64, kind: u32) -> usize {
+    use crate::stage_trace::{self, Stage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if bytes < TRACE_MIN_BYTES || !stage_trace::diagnostics() {
+        return 0;
+    }
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    let id = (1usize << (usize::BITS - 1)) | NEXT.fetch_add(1, Ordering::Relaxed);
+    stage_trace::mark(id, Stage::MemoryBegin, kind);
+    stage_trace::mark(
+        id,
+        Stage::MemoryPool,
+        if kind == 3 {
+            0x80000000 | pool.1
+        } else {
+            pool.1 * 2 + u32::from(pool.0 == Holds::Images)
+        },
+    );
+    stage_trace::mark(
+        id,
+        Stage::MemoryBytes,
+        (bytes >> 10).min(u64::from(u32::MAX)) as u32,
+    );
+    stage_trace::mark(
+        id,
+        Stage::MemoryAvailable,
+        (available >> 10).min(u64::from(u32::MAX)) as u32,
+    );
+    id
+}
+
+fn trace_handle(id: usize, memory: vk::DeviceMemory) {
+    use crate::stage_trace::{self, Stage};
+    use ash::vk::Handle;
+    if id != 0 {
+        let raw = memory.as_raw();
+        stage_trace::mark(id, Stage::MemoryHandleLow, raw as u32);
+        stage_trace::mark(id, Stage::MemoryHandleHigh, (raw >> 32) as u32);
+    }
+}
+
 /// What memory a resource needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum MemoryClass {
@@ -568,7 +619,10 @@ pub(super) const ZERO_INITIALIZE: vk::MemoryAllocateFlags = vk::MemoryAllocateFl
 /// timed, the submission's fence read after both. On ANV (Mesa 26.2.4, the UHD 770 of RPL-S) the
 /// bind took 0.2 to 1.8 us and the view 1.8 to 5.1 us; on RADV (Mesa 26.0.8) 0.0 to 0.6 us and
 /// 0.6 to 2.0 us on the Radeon 780M and the RX 7900 XTX; the submission still pending after both
-/// in every round, as with a fresh block. There ([`binds_wait`]) such an image shares a pooled
+/// in every round, as with a fresh block. Turnip's bind waits for nothing either, read in its
+/// source and not measured: `tu_image_bind` (Mesa's `tu_image.cc`) records the memory, the offset
+/// and the image's address and makes no kernel call and takes no lock, and `tu_CreateImageView`
+/// none either. There ([`binds_wait`]) such an image shares a pooled
 /// block ([`allocate_image_while_queued`]), and every submission names one buffer object fewer
 /// to the kernel for each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1065,6 +1119,14 @@ impl<T> Pool<T> {
         }
     }
 
+    /// The bytes of its pooled blocks.
+    pub(super) fn pooled_bytes(&self) -> u64 {
+        (self.blocks.iter().flatten())
+            .filter(|block| !block.dedicated)
+            .map(|block| block.ranges.len())
+            .sum()
+    }
+
     /// Whether a pooled block has room for `size` bytes at the largest alignment asked of the
     /// pool so far: whether [`Pool::room`] is that long.
     ///
@@ -1307,13 +1369,18 @@ impl<T> Pool<T> {
     /// imports, whatever else they are.
     fn count_into(&self, census: &mut Census, imported: impl Fn(&T) -> bool) {
         for block in self.blocks.iter().flatten() {
-            let count = match (imported(&block.payload), block.dedicated) {
-                (true, _) => &mut census.imported,
-                (false, _) if block.empty() => &mut census.empty,
-                (false, true) => &mut census.dedicated,
-                (false, false) => &mut census.pooled,
+            let bytes = block.ranges.len();
+            let (count, total) = match (imported(&block.payload), block.dedicated) {
+                (true, _) => (&mut census.imported, &mut census.imported_bytes),
+                (false, _) if block.empty() => (&mut census.empty, &mut census.empty_bytes),
+                (false, true) => (&mut census.dedicated, &mut census.dedicated_bytes),
+                (false, false) => {
+                    census.pooled_used_bytes += block.ranges.used();
+                    (&mut census.pooled, &mut census.pooled_bytes)
+                }
             };
             *count += 1;
+            *total += bytes;
         }
     }
 }
@@ -1353,6 +1420,53 @@ impl FreeCause {
     pub(super) const COUNT: usize = 7;
 }
 
+/// How many size classes [`MemoryKinds`] counts a block in: at most 16, 32, 40, 48, 56 and
+/// 64 MiB, and larger.
+pub const MEMORY_KIND_CLASSES: usize = 7;
+
+/// The size class of a block of `bytes` ([`MEMORY_KIND_CLASSES`]).
+fn kind_class(bytes: u64) -> usize {
+    const BOUNDS: [u64; MEMORY_KIND_CLASSES - 1] =
+        [16 << 20, 32 << 20, 40 << 20, 48 << 20, 56 << 20, 64 << 20];
+    (BOUNDS.iter())
+        .position(|&bound| bytes <= bound)
+        .unwrap_or(MEMORY_KIND_CLASSES - 1)
+}
+
+/// A device's live blocks of its own memory by what holds them and by size
+/// ([`Device::memory_kinds`](crate::Device::memory_kinds)): where the driver backs each block
+/// with a buffer object of the system's memory as it is made, which of them make up a process's
+/// large buffer objects. The caller's host memory imported and a buffer's own pages are in none
+/// of the classes: the driver allocates nothing for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryKinds {
+    /// Pooled blocks with a placement, by size class.
+    pub pooled: [u64; MEMORY_KIND_CLASSES],
+    /// Pooled blocks kept empty for the next placement.
+    pub empty: [u64; MEMORY_KIND_CLASSES],
+    /// Dedicated blocks of images kept spare for the next image.
+    pub spare: [u64; MEMORY_KIND_CLASSES],
+    /// Dedicated blocks that hold an image.
+    pub dedicated_images: [u64; MEMORY_KIND_CLASSES],
+    /// Dedicated blocks that hold a buffer.
+    pub dedicated_buffers: [u64; MEMORY_KIND_CLASSES],
+    /// The bytes of the spare blocks.
+    pub spare_bytes: u64,
+    /// The bytes of the dedicated blocks that hold an image.
+    pub dedicated_image_bytes: u64,
+    /// The bytes of the dedicated blocks that hold a buffer.
+    pub dedicated_buffer_bytes: u64,
+    /// The blocks of a lazily allocated memory type with a placement: how many, their bytes,
+    /// how many of them the driver committed memory to and the bytes it committed
+    /// (`vkGetDeviceMemoryCommitment`). A transient attachment's memory is committed where a
+    /// pass renders it outside tile memory.
+    pub lazy: [u64; 4],
+    /// The same of the lazily allocated blocks with no placement, kept empty or spare.
+    pub lazy_kept: [u64; 4],
+    /// A buffer's own pages imported as a block each: how many, and their bytes.
+    pub own_pages: [u64; 2],
+}
+
 /// A device's live `VkDeviceMemory` blocks, by kind ([`Memory::census`]): each one buffer
 /// object the driver lists in every submission where it lists every allocation (ANV on i915).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1366,6 +1480,13 @@ pub(super) struct Census {
     pub(super) dedicated: u64,
     /// The caller's host memory imported ([`import_host`]), a block each.
     pub(super) imported: u64,
+    /// The bytes of those blocks: pooled ones, the bytes placed in them, empty kept ones,
+    /// dedicated ones and imports.
+    pub(super) pooled_bytes: u64,
+    pub(super) pooled_used_bytes: u64,
+    pub(super) empty_bytes: u64,
+    pub(super) dedicated_bytes: u64,
+    pub(super) imported_bytes: u64,
 }
 
 /// A host pointer the runtime may send between threads: the mapping of a block it owns.
@@ -1526,6 +1647,11 @@ struct BlockAddresses {
 }
 
 impl Block {
+    /// Whether it is the runtime's own memory, imported from nothing.
+    fn plain(&self) -> bool {
+        !self.imported && self.pages.is_none() && self.view.is_none()
+    }
+
     /// Whether another placement may take its memory once its own went: memory the runtime
     /// allocated for itself, neither an import nor a buffer's dedicated allocation
     /// (`VkMemoryDedicatedAllocateInfo`, which binds that buffer alone).
@@ -2548,6 +2674,60 @@ impl Memory {
         census
     }
 
+    /// Its live blocks of its own memory by what holds them and by size, and what `device`'s
+    /// driver committed of the lazily allocated ones ([`MemoryKinds`]).
+    pub(super) fn kinds(&self, device: &ash::Device) -> MemoryKinds {
+        let mut kinds = MemoryKinds::default();
+        let lazy = |block: &Block| {
+            (self.types.get(block.type_index as usize)).is_some_and(|ty| {
+                (ty.property_flags).contains(vk::MemoryPropertyFlags::LAZILY_ALLOCATED)
+            })
+        };
+        let commitment = |into: &mut [u64; 4], block: &Block, bytes: u64| {
+            if !lazy(block) {
+                return;
+            }
+            // SAFETY: the block is live under the memory's lock, and its memory type is lazily
+            // allocated (VUID-vkGetDeviceMemoryCommitment-memory-00690).
+            let committed = unsafe { device.get_device_memory_commitment(block.memory) };
+            into[0] += 1;
+            into[1] += bytes;
+            into[2] += u64::from(committed != 0);
+            into[3] += committed;
+        };
+        for (at, pool) in self.pools.iter().enumerate() {
+            let images = at >= self.types.len();
+            for block in pool.blocks.iter().flatten() {
+                let bytes = block.ranges.len();
+                if block.payload.imported {
+                    continue;
+                }
+                if !block.payload.plain() {
+                    kinds.own_pages[0] += 1;
+                    kinds.own_pages[1] += bytes;
+                    continue;
+                }
+                let class = kind_class(bytes);
+                let kept = !block.dedicated && block.ranges.is_empty();
+                match (block.dedicated, images) {
+                    (true, true) => {
+                        kinds.dedicated_images[class] += 1;
+                        kinds.dedicated_image_bytes += bytes;
+                    }
+                    (true, false) => {
+                        kinds.dedicated_buffers[class] += 1;
+                        kinds.dedicated_buffer_bytes += bytes;
+                    }
+                    (false, _) if kept => kinds.empty[class] += 1,
+                    (false, _) => kinds.pooled[class] += 1,
+                }
+                let into = if kept { &mut kinds.lazy_kept } else { &mut kinds.lazy };
+                commitment(into, &block.payload, bytes);
+            }
+        }
+        kinds
+    }
+
     /// Whether one of the memory types `allowed` names is of `class`.
     pub(super) fn has_type(&self, allowed: u32, class: MemoryClass) -> bool {
         self.class_types(allowed, class) != 0
@@ -2950,13 +3130,11 @@ impl Memory {
         pool.add_as(size, dedicated, block, used, zeroed)
     }
 
-    /// The bytes of a pooled block made for `pool`: [`Memory::block_bytes`], and a block of
-    /// images' [`Memory::image_block_bytes`].
+    /// The bytes of the next pooled block made for `pool`: as many as its pooled blocks have (the
+    /// pool doubles), at least [`FIRST_BLOCK_BYTES`], at most [`Memory::block_bytes`], and a block
+    /// of images' [`Memory::image_block_bytes`] ([`Memory::next_block_bytes`]).
     fn pooled_bytes(&self, pool: (Holds, u32)) -> u64 {
-        match pool.0 {
-            Holds::Images => self.image_block_bytes,
-            _ => self.block_bytes,
-        }
+        self.next_block_bytes(pool, 1)
     }
 
     /// The bytes of each live pooled block that holds `holds`, of every memory type, for the
@@ -3018,6 +3196,21 @@ impl Memory {
             .collect()
     }
 
+    /// The size of the next pooled block of `pool` for a placement of `size` bytes: as many bytes
+    /// as its pooled blocks have (the pool doubles), at least [`FIRST_BLOCK_BYTES`] and the
+    /// placement's next power of two, at most [`BLOCK_BYTES`] (or the device's largest
+    /// allocation).
+    fn next_block_bytes(&self, pool: (Holds, u32), size: u64) -> u64 {
+        let have = self.pool_ref(pool.0, pool.1).pooled_bytes();
+        let most = match pool.0 {
+            Holds::Images => self.image_block_bytes,
+            _ => self.block_bytes,
+        };
+        (have.max(FIRST_BLOCK_BYTES).max(size.next_power_of_two()))
+            .min(most)
+            .max(size)
+    }
+
     /// What making a block takes, copied out so that the block is made with the memory's lock
     /// released ([`place`], [`keep_room`]).
     fn maker(&self) -> BlockMaker {
@@ -3026,7 +3219,6 @@ impl Memory {
             .fold(0, |bits, (index, _)| bits | 1 << index);
         BlockMaker {
             block_bytes: self.block_bytes,
-            image_block_bytes: self.image_block_bytes,
             host_visible,
             fd_types: self.fd_buffer_types.unwrap_or(0),
             page_types: self.page_buffer_types.unwrap_or(0),
@@ -3222,7 +3414,9 @@ impl Memory {
         let spare = self
             .kept_budget(heap)
             .saturating_sub(self.kept_in_heap(heap));
-        let half = self.block_bytes / 2;
+        // A dedicated block is larger than half its pool's block as it was made, and a pool's
+        // blocks grow from [`FIRST_BLOCK_BYTES`]: every dedicated one past half of that is kept.
+        let half = FIRST_BLOCK_BYTES / 2;
         let reusable = |block: &Block| block.reusable() && block.size > half;
         let pool = self.pool(holds, type_index);
         let freed = pool.release(block, (offset, size), now, spare, reusable);
@@ -3310,6 +3504,21 @@ impl Memory {
         count
     }
 
+    /// Free every kept empty block, pooled and dedicated: the system reports memory pressure,
+    /// the signal Metal's resource cache gives memory back on. How many went.
+    pub(super) fn release_all_kept(&mut self, device: &ash::Device) -> usize {
+        let mut blocks: Vec<Block> = Vec::new();
+        for pool in &mut self.pools {
+            blocks.extend(pool.take_kept());
+        }
+        let count = blocks.len();
+        for block in blocks {
+            // SAFETY: nothing is placed in a kept empty block, and no command reads it.
+            drop(unsafe { self.let_go(device, block, FreeCause::KeptForRoom, None) });
+        }
+        count
+    }
+
     /// Over every pool: the block slots the room queries have walked and the free ranges they
     /// have visited ([`Pool::room_work`]), then what one query of each pool would walk and visit
     /// where it derived per call ([`Pool::room_per_call`]).
@@ -3383,10 +3592,18 @@ impl Memory {
         };
         let (heap, size) = (self.heap_of(block.type_index), block.size);
         let Some(parking) = &self.parking else {
+            let id = trace_memory((Holds::Buffers, block.type_index), block.size, 0, 3);
+            trace_handle(id, block.memory);
             self.say_block("freed a block", &block);
             let Some(frees) = frees else {
+                if id != 0 {
+                    crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
+                }
                 // SAFETY: the caller's.
                 unsafe { block.release(device) };
+                if id != 0 {
+                    crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
+                }
                 return after;
             };
             let Block {
@@ -3403,6 +3620,9 @@ impl Memory {
                 size,
             };
             // SAFETY: the caller's.
+            if id != 0 {
+                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryDeferred, (size >> 10) as u32);
+            }
             return unsafe { frees.post_or_free(posted, device) };
         };
         self.say_block(
@@ -3647,8 +3867,6 @@ impl Memory {
 struct BlockMaker {
     /// A pooled block's size ([`BLOCK_BYTES`], or the device's largest allocation).
     block_bytes: u64,
-    /// As [`Memory`]'s.
-    image_block_bytes: u64,
     /// The host-visible memory types, as bits: a block of one is mapped whole.
     host_visible: u32,
     /// The memory types whose [`Holds::FdBuffers`] blocks are allocated exportable, as bits.
@@ -3668,14 +3886,6 @@ struct BlockMaker {
 }
 
 impl BlockMaker {
-    /// The bytes of a pooled block made for `pool` ([`Memory::pooled_bytes`]).
-    fn pooled_bytes(&self, pool: (Holds, u32)) -> u64 {
-        match pool.0 {
-            Holds::Images => self.image_block_bytes,
-            _ => self.block_bytes,
-        }
-    }
-
     /// A new block of `size` bytes of memory type `type_index` that holds `holds`, with a buffer
     /// of addresses where `addressed` gives the counts of such buffers made (its memory then as
     /// long as that buffer requires, if longer), allocated zero-initialized where it holds images
@@ -4460,7 +4670,7 @@ pub(super) fn allocate_image_while_queued(
 fn binds_wait(driver: Option<DriverId>) -> bool {
     !matches!(
         driver,
-        Some(DriverId::INTEL_OPEN_SOURCE_MESA | DriverId::MESA_RADV)
+        Some(DriverId::INTEL_OPEN_SOURCE_MESA | DriverId::MESA_RADV | DriverId::MESA_TURNIP)
     )
 }
 
@@ -4624,13 +4834,19 @@ fn place(
         let pool = (holds, type_index);
         let block_size = match dedicated {
             true => size,
-            false => maker.pooled_bytes(pool),
+            false => lock(memory).next_block_bytes(pool, size),
         };
+        let available = lock(memory).pool(pool.0, pool.1).room();
+        let trace = trace_memory(pool, block_size, available, 1);
         if fit == Fit::Pooled {
             let mut guard = lock(memory);
             if let Some(placement) =
                 guard.place_pooled(device, pool, (size, align), addressed, class)?
             {
+                trace_handle(trace, placement.memory);
+                if trace != 0 {
+                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryReused, 1);
+                }
                 ready_after_placing(&mut guard, pool, size);
                 return Ok(guard.mark_overflowed(placement, overflowing));
             }
@@ -4673,6 +4889,10 @@ fn place(
         };
         match made {
             Ok(block) => {
+                trace_handle(trace, block.memory);
+                if trace != 0 {
+                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryAllocated, 1);
+                }
                 let mut memory = lock(memory);
                 if !dedicated && memory.makes_ahead(pool) {
                     memory.ahead.made_in_place(holds);
@@ -4691,8 +4911,16 @@ fn place(
                 memory.say_placement("placed", &placement, Some(class));
                 return Ok(memory.mark_overflowed(placement, overflowing));
             }
-            Err(error @ Error::OutOfMemory(_)) => failure = error,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if trace != 0 {
+                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryAllocated, 0);
+                }
+                if matches!(error, Error::OutOfMemory(_)) {
+                    failure = error;
+                } else {
+                    return Err(error);
+                }
+            }
         }
     }
     Err(failure)
@@ -4711,6 +4939,12 @@ fn make_room(memory: &Mutex<Memory>, device: &ash::Device, type_index: u32) -> b
     };
     let waited = frees.is_some_and(|frees| frees.wait());
     released > 0 || waited
+}
+
+/// Free the kept empty blocks whose time is up, from the room worker: a device that makes and
+/// releases nothing more still lets them go after [`KEPT_EMPTY_FOR`] ([`Memory::sweep_stale`]).
+pub(super) fn age_spares(memory: &Mutex<Memory>, device: &ash::Device) {
+    lock(memory).sweep_stale(device, Instant::now());
 }
 
 /// Let `memory` keep no block from now on ([`Memory::keep_none`]): those it keeps empty freed, and
@@ -4789,7 +5023,7 @@ pub(super) fn keep_room(
         .filter(|&&(holds, _)| holds != own && holds != Holds::FdBuffers && !page(holds));
     for &pool in first.chain(rest) {
         let addressed = pool.0.buffers().then_some(&**counts);
-        let bytes = maker.pooled_bytes(pool);
+        let bytes = lock(memory).pooled_bytes(pool);
         keep_pool_room(memory, device, (&maker, addressed), (pool, bytes));
         ready_if_growing(&mut lock(memory), pool);
     }

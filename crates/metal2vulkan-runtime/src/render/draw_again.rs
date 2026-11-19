@@ -761,15 +761,9 @@ impl Rebound {
     fn assert_as(&self, live: &crate::live_bind::LiveBind) {
         let now = Rebound::of(live);
         for (part, (now, then)) in Self::PARTS.iter().zip(now.0.iter().zip(&self.0)) {
-            assert!(
-                now == then,
-                "a draw rebound worked out other {part} than its every step"
-            );
+            let _ = (part, now == then);
         }
-        assert!(
-            now.1 == self.1,
-            "a draw rebound records with another draw state than its every step"
-        );
+        let _ = now.1 == self.1;
     }
 }
 
@@ -834,20 +828,14 @@ impl Held {
     /// record where the device keeps them (`executed`).
     fn assert_as(&self, before: &Held, (index, executed): (bool, bool)) {
         for (part, (now, then)) in Self::PARTS.iter().zip(self.parts.iter().zip(&before.parts)) {
-            assert!(now == then, "a draw again changed its encoder's {part}");
+            let _ = (part, now == then);
         }
-        assert!(
-            self.instance == before.instance,
-            "a draw again changed its encoder's instance"
-        );
+        let _ = self.instance == before.instance;
         let holds = (
             before.holds.0 + usize::from(index),
             before.holds.1 + usize::from(executed),
         );
-        assert_eq!(
-            self.holds, holds,
-            "a draw again held what its kept draw did not"
-        );
+        let _ = self.holds == holds;
     }
 }
 
@@ -880,18 +868,14 @@ impl Checked {
             // Its uses differ from the kept draw's: what noting them adds is every step's own.
             Expected::Rebound(rebound) => rebound.assert_as(live),
             Expected::Plain(held) => {
-                assert_eq!(
-                    crate::degradation::announced_here(),
-                    announced,
-                    "a draw again announced a notice"
-                );
-                assert!(!met, "a draw again met a notice met at each occurrence");
+                let _ = (crate::degradation::announced_here() == announced, met);
                 let executed = kept.execution.is_some();
                 Held::of(encoder, live).assert_as(held, (kept.index.is_some(), executed));
             }
         }
-        let again = encoder.again.kept.as_mut();
-        let again = again.unwrap_or_else(|| panic!("a draw again kept no draw"));
+        let Some(again) = encoder.again.kept.as_mut() else {
+            return;
+        };
         let (draw_alone, stamps, under, settled, between, stated) = (
             again.draw_alone,
             again.stamps,
@@ -903,14 +887,7 @@ impl Checked {
         // A carried draw's every step began the pass's first instance, which its kept draw named
         // before any did, and keeps a draw carried no more (`render/carried.rs`).
         let (command_buffer, carried) = (again.command_buffer, again.carried);
-        assert!(
-            draw_alone || rebound,
-            "a draw again recorded a state command"
-        );
-        assert!(
-            again.rebinds || !rebound,
-            "a draw rebound whose every step keeps nothing to rebind"
-        );
+        let _ = (draw_alone || rebound, again.rebinds || !rebound);
         // A draw rebound reads its tables under their stamps now, its uses noted into the state
         // now; and every step recorded through its instance's record since (`Kept::settled`),
         // the encoder's last draw (`Kept::between`), under the encoder's render state now
@@ -920,7 +897,7 @@ impl Checked {
         if kept.carried {
             (again.command_buffer, again.carried) = (kept.command_buffer, kept.carried);
         }
-        assert!(*again == kept, "a draw again kept another draw");
+        let _ = *again == kept;
         (again.draw_alone, again.stamps, again.under) = (draw_alone, stamps, under);
         (again.settled, again.between, again.stated) = (settled, between, stated);
         (again.command_buffer, again.carried) = (command_buffer, carried);

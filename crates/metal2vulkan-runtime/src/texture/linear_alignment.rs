@@ -207,7 +207,7 @@ impl Device {
     /// of any (the record's, else the probe's) and kept for the device's life.
     pub(crate) fn linear_texture_alignment(&self, pf: PixelFormat) -> u64 {
         let shared = self.shared();
-        if shared.host_import.is_err() {
+        if !(shared.host_import.as_ref()).is_ok_and(|imp| imp.imports_pointers()) {
             return LINEAR_ALIGNMENT;
         }
         let answers = (shared.textures.linear_alignments).get_or_init(|| self.linear_alignments());

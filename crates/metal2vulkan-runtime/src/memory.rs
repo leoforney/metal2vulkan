@@ -238,6 +238,9 @@ const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
 /// wired as it is made (a guest whose GPU imports its pages), a process with a few small resources
 /// otherwise held a 64 MiB block in each of its pools: 256-640 MiB each, 2 GiB in all at an iPadOS
 /// guest's home screen.
+#[cfg(target_os = "fuchsia")]
+pub(super) const FIRST_BLOCK_BYTES: u64 = 16 << 20;
+#[cfg(not(target_os = "fuchsia"))]
 pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
 
 /// Memory operations below this size are not traced.
@@ -3415,8 +3418,8 @@ impl Memory {
             .kept_budget(heap)
             .saturating_sub(self.kept_in_heap(heap));
         // A dedicated block is larger than half its pool's block as it was made, and a pool's
-        // blocks grow from [`FIRST_BLOCK_BYTES`]: every dedicated one past half of that is kept.
-        let half = FIRST_BLOCK_BYTES / 2;
+        // blocks grow from 4 MiB on host: every dedicated one past 2 MiB is kept.
+        let half = 2 << 20;
         let reusable = |block: &Block| block.reusable() && block.size > half;
         let pool = self.pool(holds, type_index);
         let freed = pool.release(block, (offset, size), now, spare, reusable);
@@ -4593,6 +4596,7 @@ unsafe fn import_pointer(
 /// Place memory meeting a buffer's `requirements` of `class` in `memory`: in a pooled block with
 /// room, else in a new block (dedicated when larger than half a block), trying the class's
 /// memory types best first, then those it overflows into ([`overflow_candidates`], [`place`]).
+#[track_caller]
 pub(super) fn allocate(
     memory: &Mutex<Memory>,
     device: &ash::Device,
@@ -4604,6 +4608,7 @@ pub(super) fn allocate(
 
 /// [`allocate`] in a block that holds `holds`: [`Holds::Buffers`], or [`Holds::FdBuffers`] for a
 /// buffer made for [`FD_BLOCKS_HANDLE`] (`buffer.rs`'s `placed_new_buffer`).
+#[track_caller]
 pub(super) fn allocate_in(
     memory: &Mutex<Memory>,
     device: &ash::Device,
@@ -4623,6 +4628,7 @@ pub(super) fn allocate_in(
 }
 
 /// [`allocate`] for an image: in a block that holds images alone ([`Holds`]).
+#[track_caller]
 pub(super) fn allocate_image(
     memory: &Mutex<Memory>,
     device: &ash::Device,
@@ -4644,6 +4650,7 @@ pub(super) fn allocate_image(
 /// be queued (a neutral image, `neutral.rs`; a storage placeholder, `storage_placeholder.rs`): in
 /// a block of its own (`Fit::Apart`) where such a bind waits for that work ([`binds_wait`]),
 /// freed with it, else in a pooled block like any image.
+#[track_caller]
 pub(super) fn allocate_image_while_queued(
     memory: &Mutex<Memory>,
     device: &ash::Device,
@@ -4678,6 +4685,7 @@ fn binds_wait(driver: Option<DriverId>) -> bool {
 /// (the module docs): in a block of a memory type a buffer of addresses takes, which gets one if
 /// it has none (counted in `counts`), and with the placement's `address`. Without
 /// `bufferDeviceAddress`, as `allocate`.
+#[track_caller]
 pub(super) fn allocate_addressed(
     memory: &Mutex<Memory>,
     device: &ash::Device,
@@ -4695,6 +4703,7 @@ pub(super) fn allocate_addressed(
 }
 
 /// [`allocate_addressed`] in a block that holds `holds` ([`allocate_in`]).
+#[track_caller]
 pub(super) fn allocate_addressed_in(
     memory: &Mutex<Memory>,
     device: &ash::Device,
@@ -4798,6 +4807,7 @@ pub(super) fn allocate_exported(
 /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` within 4 µs (median under 1 µs), where a 48 MiB `Private`
 /// buffer's whole make took 6.9 ms there (median of 8, longest 7.2 ms; 0.47 ms in device-local
 /// memory) and a 4096 x 4096 `RGBA8Unorm` texture's 9.2 ms (longest 9.5 ms; 0.65 ms).
+#[track_caller]
 fn place(
     memory: &Mutex<Memory>,
     device: &ash::Device,
@@ -4807,6 +4817,7 @@ fn place(
     holds: Holds,
     fit: Fit,
 ) -> Result<Placement, Error> {
+    let place_caller = std::panic::Location::caller();
     let size = requirements.size.max(1);
     let align = requirements.alignment.max(1);
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -4882,6 +4893,29 @@ fn place(
         }
         // The type's kept empty blocks go, and the frees posted complete, before a block of it
         // fails to be made.
+        #[cfg(target_os = "fuchsia")]
+        {
+            let line = format!(
+                "[VKPLACE] caller={}:{} holds={:?} class={:?} dedicated={} req_size={} block_size={} mem_type={}\n",
+                place_caller.file(),
+                place_caller.line(),
+                holds,
+                class,
+                dedicated,
+                size,
+                block_size,
+                type_index,
+            );
+            eprint!("{line}");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/perf_trace.log")
+            {
+                use std::io::Write;
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
         let make = || maker.make(device, pool, block_size, addressed);
         let made = match make() {
             Err(Error::OutOfMemory(_)) if make_room(memory, device, type_index) => make(),

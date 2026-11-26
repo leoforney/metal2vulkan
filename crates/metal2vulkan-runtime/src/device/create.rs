@@ -1204,7 +1204,7 @@ pub(crate) fn queue_plan_within(
         .clamp(LEAST_QUEUES.min(ceiling) as usize, ceiling as usize)
         .min(order.len());
     let mut rest = order.split_off(round_robin).into_iter();
-    let present = rest.by_ref().take(presenting as usize).collect();
+    let mut present: Vec<_> = rest.by_ref().take(presenting as usize).collect();
     let reserved = rest.take(reserved as usize).collect();
     // Copies of any texel, on a family none of the queues above are of.
     let unit = vk::Extent3D {
@@ -1236,6 +1236,13 @@ pub(crate) fn queue_plan_within(
     let staging = copy_engine
         .or_else(beside)
         .map(|(index, _)| (index as u32, 0));
+    #[cfg(target_os = "fuchsia")]
+    let staging = {
+        order.truncate(1);
+        present.clear();
+        let _ = staging;
+        None
+    };
     // Where every family is equivalent, the primary is family 0, so either way the primary
     // family's first queue leads (internal submissions go there).
     Some(QueuePlan {
@@ -2010,6 +2017,15 @@ pub(super) fn create_on(
         enables.enable_generated_commands();
     }
     let host_names = host_image_copy_names(api);
+    #[cfg(target_os = "fuchsia")]
+    let host_image_copy = {
+        // gfxstream's generated `reservedmarshal_VkMemoryToImageCopyEXT` only marshals 1 byte
+        // (`sizeof(const uint8_t)`) of `pHostPointer`, leaving `VK_EXT_host_image_copy` textures
+        // zeroed/uninitialized on the host; stage texture uploads through `vkCmdCopyBufferToImage`.
+        let _ = host_names;
+        false
+    };
+    #[cfg(not(target_os = "fuchsia"))]
     let host_image_copy = host_image_copy(host_names, &listed, || {
         // SAFETY: `physical` was enumerated from the instance, which uses it at `api`; asked
         // only where `api` makes the feature core or the device lists its extension.

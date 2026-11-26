@@ -277,6 +277,9 @@ impl Uploads {
             unsafe { std::ptr::write_bytes(mapped.as_ptr().add(at as usize), 0, tail as usize) };
             device.shared().counts.new_buffer_cleared(tail);
         }
+        unsafe {
+            crate::copied::fuchsia_cache_clean(mapped.as_ptr().add(offset as usize), len as usize);
+        }
         chunk.used = end;
         Ok(Upload {
             buffer: chunk.buffer.clone(),
@@ -336,6 +339,7 @@ impl Upload {
                 mapped.as_ptr().add(self.offset as usize),
                 len,
             );
+            crate::copied::fuchsia_cache_clean(mapped.as_ptr().add(self.offset as usize), len);
         }
     }
 
@@ -351,6 +355,10 @@ impl Upload {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
+                mapped.as_ptr().add((self.offset + at) as usize),
+                len,
+            );
+            crate::copied::fuchsia_cache_clean(
                 mapped.as_ptr().add((self.offset + at) as usize),
                 len,
             );
@@ -380,6 +388,10 @@ impl Upload {
                 mapped.as_ptr().add((self.offset + at) as usize),
                 len,
             );
+            crate::copied::fuchsia_cache_clean(
+                mapped.as_ptr().add((self.offset + at) as usize),
+                len,
+            );
         }
     }
 
@@ -401,6 +413,10 @@ impl Upload {
         // memory; the bytes at `to` are writable and apart from it (the caller's contract). A raw
         // copy, as another thread may read or write those bytes meanwhile.
         unsafe {
+            crate::copied::fuchsia_cache_clean_invalidate(
+                mapped.as_ptr().add((self.offset + at) as usize),
+                len,
+            );
             std::ptr::copy_nonoverlapping(
                 mapped.as_ptr().add((self.offset + at) as usize),
                 to,

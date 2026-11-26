@@ -1729,7 +1729,10 @@ impl BlitCommandEncoder {
         };
         // SAFETY: the mapping covers the buffer's `bytes.len()` bytes, which nothing else uses
         // yet.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.as_ptr(), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.as_ptr(), bytes.len());
+            crate::copied::fuchsia_cache_clean(contents.as_ptr(), bytes.len());
+        };
         Ok(buffer)
     }
 }

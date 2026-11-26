@@ -450,6 +450,7 @@ fn upload(
             mapped.as_ptr().add(skip as usize),
             bytes.len(),
         );
+        crate::copied::fuchsia_cache_clean(mapped.as_ptr().add(skip as usize), bytes.len());
     }
     Ok((buffer, start + skip))
 }

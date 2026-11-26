@@ -461,7 +461,10 @@ impl Table {
         }
         let start = table.start()?;
         // SAFETY: the null table's words lie inside the placement, which nothing reads yet.
-        unsafe { std::ptr::write_bytes(start.add(TABLE_BYTES as usize), 0, null as usize) };
+        unsafe {
+            std::ptr::write_bytes(start.add(TABLE_BYTES as usize), 0, null as usize);
+            crate::copied::fuchsia_cache_clean(start, (TABLE_BYTES + null) as usize);
+        };
         Ok(table)
     }
 
@@ -485,7 +488,10 @@ impl Table {
         let at = at as usize * entry.len();
         // SAFETY: `at` is below `TABLE_ENTRIES`, so the entry lies inside the mapped placement;
         // a command reading it meanwhile reads the old entry or the new one (the module docs).
-        unsafe { std::ptr::copy_nonoverlapping(entry.as_ptr(), start.add(at), entry.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(entry.as_ptr(), start.add(at), entry.len());
+            crate::copied::fuchsia_cache_clean(start.add(at), entry.len());
+        };
     }
 
     /// The descriptor of the table's first `entries` entries.

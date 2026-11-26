@@ -50,6 +50,9 @@ impl Device {
         let Ok(importer) = shared.host_import.as_ref() else {
             return Ok(false);
         };
+        if !importer.imports_pointers() {
+            return Ok(false);
+        }
         if self.is_lost() {
             return Err(self.lost_refusal());
         }

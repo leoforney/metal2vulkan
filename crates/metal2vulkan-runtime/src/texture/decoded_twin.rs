@@ -1373,6 +1373,12 @@ impl Image {
                 std::ptr::copy_nonoverlapping(plan.shape.as_ptr(), to, plan.shape.len());
             }
         }
+        unsafe {
+            crate::copied::fuchsia_cache_clean(
+                contents.as_ptr(),
+                steps.len().saturating_mul(slot as usize),
+            );
+        }
         let (kernel, sets) = match &decoded.pairs {
             None => {
                 let kernel = device.owned_kernel(OwnedModule::TwinDecode(decode))?;

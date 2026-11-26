@@ -3432,11 +3432,20 @@ impl CommandBuffer {
         let listing = Listing::new(device, used);
         // Recorded, or settled for their host steps, with the lock free: their dispatches take it,
         // and announce degradations.
+        let t_prep = std::time::Instant::now();
         let prepared: Result<Vec<_>, Error> = segments
             .iter()
             .zip(&places)
             .map(|((work, host), _)| work.prepare(self, *host))
             .collect();
+        let prep_ms = t_prep.elapsed().as_secs_f64() * 1000.0;
+        {
+            static PREP_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = PREP_N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 50 == 0 || prep_ms > 20.0 {
+                eprintln!("[PERF-STAGE] prepare #{}: {:.2}ms (segs={})", n, prep_ms, segments.len());
+            }
+        }
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {

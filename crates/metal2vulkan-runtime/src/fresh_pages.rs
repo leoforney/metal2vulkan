@@ -198,6 +198,9 @@ impl Device {
         let Ok(importer) = &shared.host_import else {
             return Ok(None);
         };
+        if !importer.imports_pointers() {
+            return Ok(None);
+        }
         let raw_device = shared.vk();
         let mut external = vk::ExternalMemoryBufferCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);

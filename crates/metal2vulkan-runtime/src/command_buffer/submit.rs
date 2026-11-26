@@ -569,9 +569,11 @@ impl CommandBufferShared {
                 scheduler.values[queue]
             })
         };
+        let t_sub0 = std::time::Instant::now();
         // The scrubs of emulated textures' writes, as mapped now, then every segment in its place.
         self.record_scrubs(&mut state, range.clone())?;
         crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 1);
+        let t_sub1 = std::time::Instant::now();
         state
             .place(range.clone())
             .map_err(|error| recording_error(device, error))?;
@@ -1089,6 +1091,7 @@ impl CommandBufferShared {
         let buffers = (submits.iter())
             .map(|info| info.command_buffer_count as usize)
             .sum();
+        let t_sub2 = std::time::Instant::now();
         crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 2);
         // From here its heap set versions may be pending: nothing writes them any more, and its
         // first batch takes the ticket a texture that goes from now on waits for
@@ -1147,10 +1150,26 @@ impl CommandBufferShared {
                 fence,
                 relayed: &self.relayed,
             };
+            let t_vk = std::time::Instant::now();
             let submitted =
                 scheduler
                     .group
                     .submit(device, &mut scheduler.waited[queue], Some(after));
+            let vk_ms = t_vk.elapsed().as_secs_f64() * 1000.0;
+            {
+                static SUB_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SUB_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n % 50 == 0 || vk_ms > 20.0 {
+                    eprintln!(
+                        "[PERF-STAGE] submit #{}: scrubs={:.2}ms place_waits={:.2}ms vkQueueSubmit={:.2}ms (bufs={})",
+                        n,
+                        (t_sub1 - t_sub0).as_secs_f64() * 1000.0,
+                        (t_sub2 - t_sub1).as_secs_f64() * 1000.0,
+                        vk_ms,
+                        buffers,
+                    );
+                }
+            }
             crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 3);
             // A test's stand-in for a scheduler thread preempted once the call returned.
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]

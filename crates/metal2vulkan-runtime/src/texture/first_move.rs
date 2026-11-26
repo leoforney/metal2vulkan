@@ -1540,6 +1540,7 @@ impl Zeros {
                 }
             }
         }
+        unsafe { crate::copied::fuchsia_cache_clean(bytes.as_ptr(), bytes.len()) };
         Ok(made)
     }
 

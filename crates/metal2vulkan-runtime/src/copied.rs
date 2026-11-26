@@ -447,7 +447,10 @@ impl CopiedBuffers {
         } = first;
         let length = snapshot.len();
         // SAFETY: the copy is `length` bytes nothing else uses yet (the caller's).
-        unsafe { std::ptr::copy_nonoverlapping(snapshot.as_ptr(), copy.as_ptr(), length) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(snapshot.as_ptr(), copy.as_ptr(), length);
+            fuchsia_cache_clean(copy.as_ptr(), length);
+        };
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         lock(&self.entries).push(Entry {
             id,
@@ -500,6 +503,7 @@ impl CopiedBuffers {
         if self.live.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let t0 = std::time::Instant::now();
         let in_flight = in_flight();
         let asked: Vec<Asked> = (lock(&self.entries).iter())
             .filter(|entry| used.meets(&entry.keys))
@@ -518,11 +522,14 @@ impl CopiedBuffers {
             .collect();
         let plans = planned(asked, tally, &in_flight);
         let (mut moved, mut skipped, mut unused) = (0u64, 0u64, 0u64);
+        let (mut checked_entries, mut checked_bytes) = (0u64, 0u64);
         for entry in lock(&self.entries).iter_mut() {
             if !used.meets(&entry.keys) {
                 unused += 1;
                 continue;
             }
+            checked_entries += 1;
+            checked_bytes += entry.snapshot.len() as u64;
             let plan = match &entry.log {
                 Some(_) => (plans.binary_search_by_key(&entry.id, |(id, _)| *id).ok())
                     .map(|at| &plans[at].1),
@@ -556,6 +563,20 @@ impl CopiedBuffers {
                 log.merged = 0;
             }
         }
+        static COPY_IN_CALLS: AtomicU64 = AtomicU64::new(0);
+        let call_n = COPY_IN_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if call_n == 1 || call_n % 100 == 0 {
+            eprintln!(
+                "[PERF-COPIED] copy_in #{}: {:.2}ms | checked={} ({:.2} MiB) unused={} moved={}B all={}",
+                call_n,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                checked_entries,
+                (checked_bytes as f64) / (1024.0 * 1024.0),
+                unused,
+                moved,
+                used.all,
+            );
+        }
         counts.copied_copied_in(moved);
         counts.copied_copy_in_skipped(skipped);
         counts.copied_copy_ins_unused(unused);
@@ -588,9 +609,11 @@ impl CopiedBuffers {
         if self.live.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let t0 = std::time::Instant::now();
         let owed = self.owed.swap(false, Ordering::AcqRel);
         let (mut moved, mut dropped) = (0u64, 0u64);
         let (mut compared, mut skipped) = (0u64, 0u64);
+        let mut compared_bytes = 0u64;
         let mut reports = Vec::new();
         for entry in lock(&self.entries).iter_mut() {
             if !owed && !written.meets(&entry.keys) {
@@ -598,6 +621,7 @@ impl CopiedBuffers {
                 continue;
             }
             compared += 1;
+            compared_bytes += entry.snapshot.len() as u64;
             let (copy, pages) = (entry.copy, entry.pages);
             match (entry.drops_writes, &mut entry.log) {
                 // SAFETY: the entry's copy is live while it is registered (`Entry`).
@@ -616,6 +640,20 @@ impl CopiedBuffers {
                 // SAFETY: as above.
                 (false, None) => moved += unsafe { sync(copy, pages, &mut entry.snapshot, true) },
             }
+        }
+        static MERGE_CALLS: AtomicU64 = AtomicU64::new(0);
+        let call_n = MERGE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if call_n == 1 || call_n % 600 == 0 {
+            eprintln!(
+                "[PERF-COPIED] merge_back #{}: {:.2}ms | compared={} ({:.2} MiB) skipped={} moved={}B all={}",
+                call_n,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                compared,
+                (compared_bytes as f64) / (1024.0 * 1024.0),
+                skipped,
+                moved,
+                written.all,
+            );
         }
         // Reported with no lock of the copies' held.
         for (log, writer, blocks) in reports {
@@ -777,6 +815,78 @@ pub(crate) const SYNC_BLOCK: usize = 4096;
 /// is looked into, 8 bytes at a time and then byte by byte, so no byte the comparison found equal
 /// is written ([`merge_block`]).
 ///
+#[derive(Clone, Copy)]
+struct SyncSliceTask {
+    from_addr: usize,
+    to_addr: usize,
+    snap_addr: usize,
+    len: usize,
+    keep_to: bool,
+}
+
+struct SyncWorkerSlot {
+    state: Mutex<(Option<SyncSliceTask>, u64, bool)>,
+    wake_worker: std::sync::Condvar,
+    wake_caller: std::sync::Condvar,
+}
+
+struct ParallelSyncPool {
+    dispatch_gate: Mutex<()>,
+    workers: [Arc<SyncWorkerSlot>; 3],
+}
+
+fn parallel_sync_pool() -> &'static ParallelSyncPool {
+    static POOL: std::sync::OnceLock<ParallelSyncPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let make_slot = || {
+            let slot = Arc::new(SyncWorkerSlot {
+                state: Mutex::new((None, 0, false)),
+                wake_worker: std::sync::Condvar::new(),
+                wake_caller: std::sync::Condvar::new(),
+            });
+            let worker_slot = Arc::clone(&slot);
+            let _ = std::thread::Builder::new()
+                .name("m2v-copy-sync".into())
+                .spawn(move || loop {
+                    let task = {
+                        let mut guard = worker_slot
+                            .state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        while guard.0.is_none() {
+                            guard = worker_slot
+                                .wake_worker
+                                .wait(guard)
+                                .unwrap_or_else(|e| e.into_inner());
+                        }
+                        guard.0.take().unwrap()
+                    };
+                    // SAFETY: Caller holds `snapshot` borrow and mapped `from`/`to` slices
+                    // disjoint from every other slice until `guard.2 = true` wakes it.
+                    let written = unsafe {
+                        let from = NonNull::new_unchecked(task.from_addr as *mut u8);
+                        let to = NonNull::new_unchecked(task.to_addr as *mut u8);
+                        let snap =
+                            std::slice::from_raw_parts_mut(task.snap_addr as *mut u8, task.len);
+                        sync_blocks(from, to, snap, task.keep_to, |_| {})
+                    };
+                    let mut guard = worker_slot
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard.1 = written;
+                    guard.2 = true;
+                    worker_slot.wake_caller.notify_one();
+                });
+            slot
+        };
+        ParallelSyncPool {
+            dispatch_gate: Mutex::new(()),
+            workers: [make_slot(), make_slot(), make_slot()],
+        }
+    })
+}
+
 /// # Safety
 ///
 /// `from` and `to` are `snapshot.len()` bytes of mapped memory each.
@@ -786,6 +896,67 @@ pub(crate) unsafe fn sync(
     snapshot: &mut [u8],
     keep_to: bool,
 ) -> u64 {
+    const PARALLEL_THRESHOLD: usize = 256 * 1024;
+    let total = snapshot.len();
+    if total >= PARALLEL_THRESHOLD {
+        let pool = parallel_sync_pool();
+        if let Ok(_gate) = pool.dispatch_gate.try_lock() {
+            let total_blocks = (total + SYNC_BLOCK - 1) / SYNC_BLOCK;
+            if total_blocks >= 4 {
+                let blocks_per_way = (total_blocks + 3) / 4;
+                let bytes_per_way = blocks_per_way * SYNC_BLOCK;
+                let base_from = from.as_ptr() as usize;
+                let base_to = to.as_ptr() as usize;
+                let base_snap = snapshot.as_mut_ptr() as usize;
+
+                let mut launched = 0usize;
+                for i in 0..3 {
+                    let start = (i + 1) * bytes_per_way;
+                    if start >= total {
+                        break;
+                    }
+                    let len = (total - start).min(bytes_per_way);
+                    let mut guard = pool.workers[i]
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard.1 = 0;
+                    guard.2 = false;
+                    guard.0 = Some(SyncSliceTask {
+                        from_addr: base_from + start,
+                        to_addr: base_to + start,
+                        snap_addr: base_snap + start,
+                        len,
+                        keep_to,
+                    });
+                    pool.workers[i].wake_worker.notify_one();
+                    launched = i + 1;
+                }
+
+                let own_len = total.min(bytes_per_way);
+                // SAFETY: `[0..own_len)` is disjoint from worker slices `[bytes_per_way..)`.
+                let mut written = unsafe {
+                    let own_snap = std::slice::from_raw_parts_mut(base_snap as *mut u8, own_len);
+                    sync_blocks(from, to, own_snap, keep_to, |_| {})
+                };
+
+                for i in 0..launched {
+                    let mut guard = pool.workers[i]
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    while !guard.2 {
+                        guard = pool.workers[i]
+                            .wake_caller
+                            .wait(guard)
+                            .unwrap_or_else(|e| e.into_inner());
+                    }
+                    written += guard.1;
+                }
+                return written;
+            }
+        }
+    }
     // SAFETY: the caller's.
     unsafe { sync_blocks(from, to, snapshot, keep_to, |_| {}) }
 }
@@ -811,6 +982,83 @@ pub(crate) unsafe fn sync_noting(
     unsafe { sync_blocks(from, to, snapshot, keep_to, note) }
 }
 
+#[inline]
+pub(crate) unsafe fn fuchsia_cache_clean(ptr: *const u8, len: usize) {
+    #[cfg(target_os = "fuchsia")]
+    if len > 0 {
+        extern "C" {
+            fn zx_cache_flush(addr: *const core::ffi::c_void, size: usize, options: u32) -> i32;
+        }
+        // ZX_CACHE_FLUSH_DATA = 1 (cleans dirty CPU cache lines to Point of Coherency / DRAM).
+        unsafe {
+            let _ = zx_cache_flush(ptr.cast(), len, 1);
+        }
+    }
+    #[cfg(not(target_os = "fuchsia"))]
+    let _ = (ptr, len);
+}
+
+#[inline]
+pub(crate) unsafe fn fuchsia_cache_clean_invalidate(ptr: *const u8, len: usize) {
+    #[cfg(target_os = "fuchsia")]
+    if len > 0 {
+        extern "C" {
+            fn zx_cache_flush(addr: *const core::ffi::c_void, size: usize, options: u32) -> i32;
+        }
+        // ZX_CACHE_FLUSH_DATA | ZX_CACHE_FLUSH_INVALIDATE = 3 (`dc civac` before reading GPU DMA).
+        unsafe {
+            let _ = zx_cache_flush(ptr.cast(), len, 3);
+        }
+    }
+    #[cfg(not(target_os = "fuchsia"))]
+    let _ = (ptr, len);
+}
+
+#[inline]
+unsafe fn block_matches_volatile(src: *const u8, was: &[u8]) -> bool {
+    let span = was.len();
+    let mut off = 0usize;
+    if (src as usize) & 7 == 0 {
+        while off + 32 <= span {
+            // SAFETY: `src + off` is 8-byte aligned and within `span` mapped bytes.
+            unsafe {
+                let a0 = std::ptr::read_volatile(src.add(off).cast::<u64>());
+                let b0 = std::ptr::read_unaligned(was.as_ptr().add(off).cast::<u64>());
+                let a1 = std::ptr::read_volatile(src.add(off + 8).cast::<u64>());
+                let b1 = std::ptr::read_unaligned(was.as_ptr().add(off + 8).cast::<u64>());
+                let a2 = std::ptr::read_volatile(src.add(off + 16).cast::<u64>());
+                let b2 = std::ptr::read_unaligned(was.as_ptr().add(off + 16).cast::<u64>());
+                let a3 = std::ptr::read_volatile(src.add(off + 24).cast::<u64>());
+                let b3 = std::ptr::read_unaligned(was.as_ptr().add(off + 24).cast::<u64>());
+                if ((a0 ^ b0) | (a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3)) != 0 {
+                    return false;
+                }
+            }
+            off += 32;
+        }
+        while off + 8 <= span {
+            // SAFETY: `src + off` is 8-byte aligned and within `span` mapped bytes.
+            unsafe {
+                let a = std::ptr::read_volatile(src.add(off).cast::<u64>());
+                let b = std::ptr::read_unaligned(was.as_ptr().add(off).cast::<u64>());
+                if a != b {
+                    return false;
+                }
+            }
+            off += 8;
+        }
+    }
+    while off < span {
+        // SAFETY: `src + off` is within `span` mapped bytes.
+        let byte = unsafe { std::ptr::read_volatile(src.add(off)) };
+        if byte != was[off] {
+            return false;
+        }
+        off += 1;
+    }
+    true
+}
+
 /// [`sync`], telling `wrote` the bytes of each block it wrote a byte of.
 ///
 /// # Safety
@@ -829,14 +1077,28 @@ unsafe fn sync_blocks(
     let mut at = 0;
     while at < snapshot.len() {
         let span = (snapshot.len() - at).min(SYNC_BLOCK);
+        let was = &mut snapshot[at..at + span];
+        if keep_to {
+            // `merge_back`: `from` is GPU-written `VkDeviceMemory`; invalidate stale CPU cache lines.
+            unsafe { fuchsia_cache_clean_invalidate(from.add(at), span) };
+        }
+        // Fast path: check directly without copying 4 KiB onto the stack when unchanged.
+        // SAFETY: `span` bytes at `from.add(at)` are mapped readable.
+        if unsafe { block_matches_volatile(from.add(at), was) } {
+            at += span;
+            continue;
+        }
         let now = &mut block[..span];
         // SAFETY: `span` bytes at `at` lie in `from` (the caller's); `block` is this call's own.
         unsafe { std::ptr::copy_nonoverlapping(from.add(at), now.as_mut_ptr(), span) };
-        let was = &mut snapshot[at..at + span];
         if now != was {
             // SAFETY: `span` bytes at `at` lie in `to` (the caller's).
             let merged = unsafe { merge_block(now, to.add(at), was, keep_to) };
             if merged > 0 {
+                if !keep_to {
+                    // `copy_in`: `to` is GPU-read `VkDeviceMemory`; clean dirty CPU cache lines to PoC.
+                    unsafe { fuchsia_cache_clean(to.add(at), span) };
+                }
                 wrote(at as u64..(at + span) as u64);
             }
             written += merged;
@@ -914,13 +1176,18 @@ pub(crate) unsafe fn restore(copy: NonNull<u8>, snapshot: &[u8]) -> u64 {
     let mut at = 0;
     while at < snapshot.len() {
         let span = (snapshot.len() - at).min(SYNC_BLOCK);
+        unsafe { fuchsia_cache_clean_invalidate(copy.add(at), span) };
         let now = &mut block[..span];
         // SAFETY: `span` bytes at `at` lie in `copy` (the caller's); `block` is this call's own.
         unsafe { std::ptr::copy_nonoverlapping(copy.add(at), now.as_mut_ptr(), span) };
         let agreed = &snapshot[at..at + span];
         if now != agreed {
             // SAFETY: as above.
-            written += unsafe { merge_block(agreed, copy.add(at), now, false) };
+            let w = unsafe { merge_block(agreed, copy.add(at), now, false) };
+            if w > 0 {
+                unsafe { fuchsia_cache_clean(copy.add(at), span) };
+            }
+            written += w;
         }
         at += span;
     }

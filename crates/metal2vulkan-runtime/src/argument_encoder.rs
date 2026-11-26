@@ -495,7 +495,8 @@ impl ArgumentEncoder {
                     bytes.as_ptr(),
                     at.as_ptr().add(offset as usize),
                     bytes.len(),
-                )
+                );
+                crate::copied::fuchsia_cache_clean(at.as_ptr().add(offset as usize), bytes.len());
             };
         }
         // A write of host pages a consumer logs is the runtime's own, which its log does not see:

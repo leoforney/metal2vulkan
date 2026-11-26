@@ -2305,7 +2305,10 @@ impl Texels {
         for (at, from) in inside.rows() {
             // SAFETY: every row lies in the buffer's mapped bytes from `start` (`bytes`); a write
             // racing the GPU's use of them is the program's, as through `contents`.
-            unsafe { std::ptr::copy_nonoverlapping(packed[from..].as_ptr(), target.add(at), n) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(packed[from..].as_ptr(), target.add(at), n);
+                crate::copied::fuchsia_cache_clean(target.add(at), n);
+            };
         }
         // A write of host pages a consumer logs is the runtime's own, which its log does not see:
         // reported, so the copies of the pages take it (`dirty_pages.rs`).
@@ -2364,7 +2367,8 @@ impl Texels {
                 // SAFETY: each run lies in the buffer's or the tail's mapped bytes
                 // (`past_runs`); a write racing the GPU's use of them is the program's.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(packed[from + into..].as_ptr(), target, len)
+                    std::ptr::copy_nonoverlapping(packed[from + into..].as_ptr(), target, len);
+                    crate::copied::fuchsia_cache_clean(target, len);
                 };
             }
             end = end.max(row + n);

@@ -473,7 +473,8 @@ impl HeapShadow {
             // planes or tiles fit the range: `host_heap_plan`, `heap_image`); a write racing the
             // GPU's use of them is the program's, as through `contents`.
             unsafe {
-                std::ptr::copy_nonoverlapping(packed[from..].as_ptr(), contents.as_ptr().add(at), n)
+                std::ptr::copy_nonoverlapping(packed[from..].as_ptr(), contents.as_ptr().add(at), n);
+                crate::copied::fuchsia_cache_clean(contents.as_ptr().add(at), n);
             };
         });
         // A write of host pages a consumer logs is the runtime's own, which its log does not see:

@@ -2255,7 +2255,10 @@ impl Device {
             .ok_or_else(|| internal("a Shared staging buffer without host bytes"))?;
         // SAFETY: the staging buffer holds `length` host-coherent bytes at `contents`, which no
         // command uses yet.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.as_ptr(), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.as_ptr(), bytes.len());
+            crate::copied::fuchsia_cache_clean(contents.as_ptr(), bytes.len());
+        };
         tile_map.buffer.fill_first_from(staging, length)
     }
 
@@ -4949,8 +4952,8 @@ pub(super) fn transfer_barrier(
 ) {
     let (src_stage, src_access, dst_stage, dst_access) = if before {
         (
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::AccessFlags::MEMORY_WRITE,
+            vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+            vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE,
             vk::PipelineStageFlags::TRANSFER,
             vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
         )
@@ -6764,6 +6767,7 @@ impl Texture {
                 std::slice::from_raw_parts_mut(contents.as_ptr(), host.packed_len() as usize)
             };
             bytes.pack(&host, packed);
+            unsafe { crate::copied::fuchsia_cache_clean(packed.as_ptr(), packed.len()) };
             // The image's texels on the host, where it holds them: the staged copy writes the
             // image these very bytes, so the shadow holds its texels still
             // (`texture/host_shadow.rs`).
@@ -6793,6 +6797,7 @@ impl Texture {
         let mut staging = Staging::new(device, host.packed_len())?;
         let packed = staging.bytes();
         bytes.pack(&host, packed);
+        unsafe { crate::copied::fuchsia_cache_clean(packed.as_ptr(), packed.len()) };
         // As above: the copy below writes the image these bytes.
         truth.shadow_written(&image_region, &unit, packed);
         let (buffer, image) = (staging.raw, truth.raw.get());
@@ -7074,7 +7079,9 @@ impl Texture {
             }
             transfer_barrier(raw, command_buffer, false);
         })?;
-        host.unpack(staging.bytes(), bytes);
+        let slice = staging.bytes();
+        unsafe { crate::copied::fuchsia_cache_clean_invalidate(slice.as_ptr(), slice.len()) };
+        host.unpack(slice, bytes);
         Ok(())
     }
 

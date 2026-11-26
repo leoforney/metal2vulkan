@@ -587,7 +587,10 @@ impl BlitCommandEncoder {
         let bytes: Vec<u8> = (0..=u8::MAX).flat_map(|value| [value; 4]).collect();
         // SAFETY: the mapping covers the buffer's `PATTERN_LENGTH` bytes, which nothing else uses
         // yet.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.as_ptr(), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents.as_ptr(), bytes.len());
+            crate::copied::fuchsia_cache_clean(contents.as_ptr(), bytes.len());
+        };
         self.pattern = Some(pattern.clone());
         Ok(pattern)
     }

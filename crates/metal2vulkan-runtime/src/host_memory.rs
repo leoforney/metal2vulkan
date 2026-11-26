@@ -1135,7 +1135,7 @@ fn mapping(line: &str, access: Access) -> Option<(u64, u64, bool)> {
 /// (`submit_check.rs`), which hold nothing of the device.
 #[derive(Clone)]
 pub(super) struct Importer {
-    functions: ash::ext::external_memory_host::DeviceFn,
+    functions: Option<ash::ext::external_memory_host::DeviceFn>,
     /// The host's page size.
     pub(super) page: u64,
     /// `minImportedHostPointerAlignment`.
@@ -1172,16 +1172,26 @@ impl Importer {
         dma_buf: bool,
         dma_buf_images: bool,
     ) -> Result<Importer, Unsupported> {
+        let page = host_page().ok_or_else(|| Unsupported::not_implemented(Feature::HostMemory))?;
         if !enabled
             .extensions
             .contains(&VkExtension::ExtExternalMemoryHost)
         {
+            #[cfg(target_os = "fuchsia")]
+            return Ok(Importer {
+                functions: None,
+                page,
+                alignment: page,
+                dma_buf: None,
+                dma_buf_images: false,
+                sparse_granule: std::sync::OnceLock::new(),
+            });
+            #[cfg(not(target_os = "fuchsia"))]
             return Err(Unsupported::needs(
                 Feature::HostMemory,
                 metal2vulkan::error::Capability::Extension(VkExtension::ExtExternalMemoryHost),
             ));
         }
-        let page = host_page().ok_or_else(|| Unsupported::not_implemented(Feature::HostMemory))?;
         let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
         // SAFETY: the caller's contract; the structure belongs to an enabled extension.
@@ -1214,13 +1224,18 @@ impl Importer {
         let dma_buf = dma_buf.then(|| ash::khr::external_memory_fd::DeviceFn::load(load));
         let dma_buf_images = dma_buf.is_some() && dma_buf_images;
         Ok(Importer {
-            functions,
+            functions: Some(functions),
             page,
             alignment,
             dma_buf,
             dma_buf_images,
             sparse_granule: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Whether the device imports host pointers (`VK_EXT_external_memory_host`).
+    pub(super) fn imports_pointers(&self) -> bool {
+        self.functions.is_some()
     }
 
     /// Whether the device imports dma-bufs (`VK_EXT_external_memory_dma_buf`), which a no-copy
@@ -1308,10 +1323,13 @@ impl Importer {
         device: &ash::Device,
         pointer: NonNull<u8>,
     ) -> Result<u32, vk::Result> {
+        let Some(functions) = &self.functions else {
+            return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE);
+        };
         let mut properties = vk::MemoryHostPointerPropertiesEXT::default();
         // SAFETY: the caller's contract; the function was loaded for this device.
         let result = unsafe {
-            (self.functions.get_memory_host_pointer_properties_ext)(
+            (functions.get_memory_host_pointer_properties_ext)(
                 device.handle(),
                 vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
                 pointer.as_ptr().cast_const().cast(),

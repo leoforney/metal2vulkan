@@ -1501,7 +1501,7 @@ fn contents(buffer: &Buffer) -> Result<NonNull<u8>, Unmade> {
 /// where the device imports no host memory at all (`VK_EXT_external_memory_host`), else one that
 /// may pass (the import of these pages refused or failed, `copied.rs`).
 fn unimported(device: &Device, why: &str) -> Unmade {
-    match device.shared().host_import.is_ok() {
+    match (device.shared().host_import.as_ref()).is_ok_and(|imp| imp.imports_pointers()) {
         true => Unmade::passing(why),
         false => Unmade::lasting(why),
     }

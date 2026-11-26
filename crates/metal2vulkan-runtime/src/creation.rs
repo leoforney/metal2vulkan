@@ -115,8 +115,28 @@ pub(crate) unsafe fn allocate_memory(
     let Some(admitted) = allocations::before_allocation(device.handle()) else {
         return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
     };
-    vk_made(VkMaking::Memory, Location::caller());
+    let caller = Location::caller();
+    vk_made(VkMaking::Memory, caller);
     note_allocation_site(info.allocation_size);
+    #[cfg(target_os = "fuchsia")]
+    {
+        let line = format!(
+            "[VKALLOC] callsite={}:{} size={} mem_type={}\n",
+            caller.file(),
+            caller.line(),
+            info.allocation_size,
+            info.memory_type_index,
+        );
+        eprint!("{line}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/perf_trace.log")
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
     let busy = allocations::Busy::of(admitted.as_deref());
     // SAFETY: the caller's.
     let memory = unsafe { device.allocate_memory(info, None) };

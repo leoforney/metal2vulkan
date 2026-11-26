@@ -650,6 +650,7 @@ impl Device {
             // that no command uses yet and nothing else reaches.
             let into = unsafe { std::slice::from_raw_parts_mut(contents.as_ptr(), bytes.len()) };
             bytes.copy_into(0, into);
+            unsafe { crate::copied::fuchsia_cache_clean(into.as_ptr(), into.len()) };
             Ok::<(), Error>(())
         };
         if buffer.storage_mode() != StorageMode::Private {
@@ -1629,6 +1630,9 @@ impl Device {
         class: MemoryClass,
         drops_writes: bool,
     ) -> Result<(HostBuffer, Placement), Error> {
+        if !importer.imports_pointers() {
+            return Err(not_importable());
+        }
         let host = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
         let buffer = self.host_buffer(window, length, host)?;
         // The window starts `window.offset` bytes before the pointer, in the pages it touches.

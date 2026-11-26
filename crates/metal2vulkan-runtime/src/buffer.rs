@@ -3682,7 +3682,10 @@ impl Buffer {
             // SAFETY: the buffer's bytes, its padded length from `contents`, are host-coherent
             // memory (`MemoryClass::Shared` and `Managed`, or imported host memory), so the
             // device sees the writes at the next submission.
-            unsafe { std::ptr::write_bytes(contents.as_ptr(), 0, size as usize) };
+            unsafe {
+                std::ptr::write_bytes(contents.as_ptr(), 0, size as usize);
+                crate::copied::fuchsia_cache_clean(contents.as_ptr(), size as usize);
+            };
             if self.mirror().is_none() {
                 return Ok(());
             }
@@ -3734,7 +3737,10 @@ impl Buffer {
         if let Some(contents) = self.contents() {
             // SAFETY: as in `clear`: the buffer's host-coherent bytes, which nothing else uses
             // yet.
-            unsafe { std::ptr::write_bytes(contents.as_ptr(), 0, size as usize) };
+            unsafe {
+                std::ptr::write_bytes(contents.as_ptr(), 0, size as usize);
+                crate::copied::fuchsia_cache_clean(contents.as_ptr(), size as usize);
+            };
             s.device.shared().counts.new_buffer_cleared(size);
             if self.mirror().is_none() {
                 return Ok(());

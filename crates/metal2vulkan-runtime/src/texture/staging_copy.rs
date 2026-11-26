@@ -452,7 +452,9 @@ impl Device {
             return Ok(zeros.raw);
         }
         let mut made = StagedBytes::new(self, ZERO_BYTES)?;
-        made.bytes().fill(0);
+        let z = made.bytes();
+        z.fill(0);
+        unsafe { crate::copied::fuchsia_cache_clean(z.as_ptr(), z.len()) };
         let raw = made.raw;
         *zeros = Some(made);
         Ok(raw)
@@ -531,7 +533,11 @@ impl Image {
             self.raw.get()
         };
         let mut bytes = StagedBytes::new(&self.device, len)?;
-        fill(bytes.bytes());
+        {
+            let slice = bytes.bytes();
+            fill(slice);
+            unsafe { crate::copied::fuchsia_cache_clean(slice.as_ptr(), slice.len()) };
+        }
         let work = Work {
             keeper: Arc::downgrade(keeper),
             raw,
@@ -584,7 +590,9 @@ impl Image {
         self.device.wait_staging(flushed.value)?;
         drop(flushed);
         drop(detached);
-        take(staging.bytes());
+        let slice = staging.bytes();
+        unsafe { crate::copied::fuchsia_cache_clean_invalidate(slice.as_ptr(), slice.len()) };
+        take(slice);
         Ok(true)
     }
 }
